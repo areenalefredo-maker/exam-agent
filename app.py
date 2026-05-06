@@ -37,27 +37,218 @@ st.caption("Upload your exam files → AI processes them → Download a formatte
 # ---------------------------- Helpers ----------------------------
 MODEL = "claude-sonnet-4-5"
 
+# ---------------------------- PDF Chunking ----------------------------
+# Claude's context window is 200K tokens. PDFs sent as documents are token-heavy
+# because Claude processes each page as both text AND an image. Empirically,
+# a typical printed exam page uses ~1.5–3K tokens, while a scanned/high-res page
+# can use 6–10K tokens or more.
+#
+# To stay safely under the 200K limit (and leave headroom for the prompt and
+# response), we split large PDFs into small chunks and process each chunk
+# independently. We also estimate token usage upfront so we can warn the user
+# before making any API calls.
+
+# Default pages per chunk. Conservative — keeps each request well under
+# 50K tokens for typical text PDFs, and under 100K even for scanned PDFs.
+DEFAULT_PAGES_PER_CHUNK = 3
+
+# Token budget per chunk. We aim to stay below this to leave room for the
+# prompt, response, and safety margin. Claude's hard limit is 200K input tokens.
+TARGET_TOKENS_PER_CHUNK = 80_000
+
+# Hard ceiling on a single chunk's estimated tokens. If even one page exceeds
+# this, we'll still try to send it on its own (and let Claude reject it if it
+# truly can't fit).
+MAX_TOKENS_PER_CHUNK = 180_000
+
+# Estimated tokens per byte of PDF content. Very rough heuristic that works
+# for most exam PDFs. Pure-text PDFs are ~0.4 tokens/byte, scanned image-heavy
+# PDFs are ~0.05 tokens/byte (because the image gets counted differently).
+# We use a middle estimate that's slightly conservative.
+EST_TOKENS_PER_BYTE = 0.15
+
+# Hard cap on total pages we'll accept, to avoid runaway cost / time.
+MAX_TOTAL_PAGES = 200
+
+
+class InputTooLargeError(Exception):
+    """Raised when input exceeds what Claude can process, even after chunking."""
+    pass
+
+
+def get_pdf_page_count(pdf_bytes):
+    """Return the number of pages in a PDF."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    n = doc.page_count
+    doc.close()
+    return n
+
+
+def estimate_pdf_tokens(pdf_bytes):
+    """Estimate how many tokens a PDF will consume when sent to Claude.
+
+    This is an approximation. The actual count depends on the page contents
+    (text density, embedded images, scan resolution). We err on the side of
+    overestimating so we don't accidentally exceed the limit.
+    """
+    return int(len(pdf_bytes) * EST_TOKENS_PER_BYTE)
+
+
+def get_page_pdf_bytes(pdf_bytes, page_index):
+    """Extract a single page from a PDF as its own PDF byte string."""
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    new_doc = fitz.open()
+    new_doc.insert_pdf(src, from_page=page_index, to_page=page_index)
+    buf = io.BytesIO()
+    new_doc.save(buf)
+    new_doc.close()
+    src.close()
+    return buf.getvalue()
+
+
+def build_size_aware_chunks(pdf_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK):
+    """Split a PDF into chunks based on estimated token cost, not just page count.
+
+    Walks pages sequentially, accumulating them into a chunk until adding another
+    page would exceed `target_tokens`. Single pages that already exceed the target
+    become their own chunk.
+
+    Returns a list of (chunk_pdf_bytes, start_page_1indexed, end_page_1indexed,
+    estimated_tokens) tuples. Page numbers refer to the ORIGINAL PDF.
+    """
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = src.page_count
+
+    # Pre-compute per-page estimated tokens by extracting each page individually
+    # and measuring its serialized size.
+    page_costs = []
+    for i in range(total):
+        single = fitz.open()
+        single.insert_pdf(src, from_page=i, to_page=i)
+        buf = io.BytesIO()
+        single.save(buf)
+        single.close()
+        page_costs.append(estimate_pdf_tokens(buf.getvalue()))
+
+    # Greedily pack pages into chunks
+    chunks = []
+    chunk_start = 0  # 0-indexed
+    chunk_tokens = 0
+    chunk_end = 0  # exclusive
+
+    for i in range(total):
+        page_cost = page_costs[i]
+        # If adding this page would exceed the target AND the current chunk has
+        # at least one page, close the current chunk and start a new one.
+        if chunk_end > chunk_start and chunk_tokens + page_cost > target_tokens:
+            new_doc = fitz.open()
+            new_doc.insert_pdf(src, from_page=chunk_start, to_page=chunk_end - 1)
+            buf = io.BytesIO()
+            new_doc.save(buf)
+            new_doc.close()
+            chunks.append((buf.getvalue(), chunk_start + 1, chunk_end, chunk_tokens))
+            chunk_start = i
+            chunk_tokens = 0
+
+        chunk_end = i + 1
+        chunk_tokens += page_cost
+
+    # Flush the final chunk
+    if chunk_end > chunk_start:
+        new_doc = fitz.open()
+        new_doc.insert_pdf(src, from_page=chunk_start, to_page=chunk_end - 1)
+        buf = io.BytesIO()
+        new_doc.save(buf)
+        new_doc.close()
+        chunks.append((buf.getvalue(), chunk_start + 1, chunk_end, chunk_tokens))
+
+    src.close()
+    return chunks
+
+
+def split_pdf_into_chunks(pdf_bytes, pages_per_chunk=DEFAULT_PAGES_PER_CHUNK):
+    """Split a PDF into chunks of N pages each (legacy fixed-size splitter).
+
+    Kept for the recursive fallback splitter. For the main extraction path,
+    prefer `build_size_aware_chunks`.
+
+    Returns a list of (chunk_pdf_bytes, start_page_1indexed, end_page_1indexed)
+    tuples. Page numbers refer to the ORIGINAL PDF.
+    """
+    src = fitz.open(stream=pdf_bytes, filetype="pdf")
+    total = src.page_count
+    chunks = []
+    for start in range(0, total, pages_per_chunk):
+        end = min(start + pages_per_chunk, total)
+        new_doc = fitz.open()
+        new_doc.insert_pdf(src, from_page=start, to_page=end - 1)
+        buf = io.BytesIO()
+        new_doc.save(buf)
+        new_doc.close()
+        chunks.append((buf.getvalue(), start + 1, end))
+    src.close()
+    return chunks
+
+
+def is_too_large_error(exc):
+    """Detect whether an Anthropic error is specifically a context-length error.
+
+    Newer SDK versions use different message formats, so we check several
+    signals: the error message text, the error body type, and the status code.
+    """
+    msg = str(exc).lower()
+    # Most common phrasings used by the API
+    if "prompt is too long" in msg:
+        return True
+    if "exceeds" in msg and "tokens" in msg:
+        return True
+    if "context window" in msg:
+        return True
+    if "context_length_exceeded" in msg:
+        return True
+    # Try the structured body if available
+    try:
+        body = getattr(exc, "body", None) or {}
+        err = body.get("error", {}) if isinstance(body, dict) else {}
+        if "too long" in str(err.get("message", "")).lower():
+            return True
+        if err.get("type") == "invalid_request_error" and "tokens" in str(err.get("message", "")).lower():
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def call_claude_with_pdf(client, pdf_bytes, prompt, max_tokens=8000):
-    """Send a PDF to Claude with a prompt and return the text response."""
-    response = client.messages.create(
-        model=MODEL,
-        max_tokens=max_tokens,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": base64.b64encode(pdf_bytes).decode()
-                    }
-                },
-                {"type": "text", "text": prompt}
-            ]
-        }]
-    )
-    return response.content[0].text
+    """Send a PDF to Claude with a prompt and return the text response.
+
+    Raises InputTooLargeError if Anthropic rejects the request as too large.
+    Callers that want to handle large inputs should split the PDF first.
+    """
+    try:
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=max_tokens,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": base64.b64encode(pdf_bytes).decode()
+                        }
+                    },
+                    {"type": "text", "text": prompt}
+                ]
+            }]
+        )
+        return response.content[0].text
+    except anthropic.BadRequestError as e:
+        if is_too_large_error(e):
+            raise InputTooLargeError(str(e)) from e
+        raise
 
 def call_claude_with_image(client, img_bytes, prompt, max_tokens=1000):
     """Send an image to Claude with a prompt."""
@@ -132,21 +323,187 @@ Use only the letter (A, B, C, or D). If a question has no clear answer, omit it.
 Return ONLY the JSON, no preamble.
 """
 
-def extract_questions(client, qp_pdf_bytes, status_callback=None):
-    """Extract structured question data from QP."""
+def process_chunk_with_adaptive_split(
+    client, chunk_bytes, prompt, max_tokens, start_page,
+    status_callback=None
+):
+    """Try to send a chunk to Claude. If it's rejected as too large, recursively
+    split it in half and try the smaller pieces. If even a single page is too
+    large, fall back to sending it as a downscaled image instead of a PDF.
+
+    Returns a list of (response_text, sub_start_page) tuples.
+    """
+    # Try the chunk as-is first
+    try:
+        text = call_claude_with_pdf(client, chunk_bytes, prompt, max_tokens=max_tokens)
+        return [(text, start_page)]
+    except InputTooLargeError:
+        pass  # Fall through to splitting
+
+    # The chunk is too large. How many pages does it have?
+    chunk_pages = get_pdf_page_count(chunk_bytes)
+
+    if chunk_pages == 1:
+        # Can't split further by pages. Try sending as a downscaled image instead.
+        if status_callback:
+            status_callback(
+                f"⚠️  Page {start_page} is too large as PDF. "
+                f"Retrying as a downscaled image..."
+            )
+        try:
+            page_img = render_page_image(chunk_bytes, 0, dpi=120)
+            # Cap dimensions to control image token cost
+            page_img.thumbnail((1568, 1568))
+            buf = io.BytesIO()
+            page_img.save(buf, format="JPEG", quality=80)
+            text = call_claude_with_image(
+                client, buf.getvalue(), prompt, max_tokens=max_tokens
+            )
+            return [(text, start_page)]
+        except Exception as fallback_err:
+            raise InputTooLargeError(
+                f"Page {start_page} is too large to process even as a downscaled image. "
+                f"This usually means the page contains very high-resolution scanned content. "
+                f"Try re-saving the PDF with reduced image quality and upload it again."
+            ) from fallback_err
+
+    # Multi-page chunk: split it in half and recurse.
+    new_size = max(1, chunk_pages // 2)
     if status_callback:
-        status_callback("Asking Claude to read the question paper...")
-    text = call_claude_with_pdf(client, qp_pdf_bytes, EXTRACTION_PROMPT, max_tokens=16000)
-    data = parse_json_from_text(text)
-    return data.get("questions", [])
+        status_callback(
+            f"⚠️  Chunk at pages {start_page}–{start_page + chunk_pages - 1} "
+            f"was too large. Splitting into pieces of {new_size} page(s) and retrying..."
+        )
+
+    sub_chunks = split_pdf_into_chunks(chunk_bytes, new_size)
+    results = []
+    for sub_bytes, sub_start, sub_end in sub_chunks:
+        # sub_start is 1-indexed within the original chunk; map back to absolute.
+        absolute_start = start_page + (sub_start - 1)
+        results.extend(
+            process_chunk_with_adaptive_split(
+                client, sub_bytes, prompt, max_tokens, absolute_start,
+                status_callback=status_callback
+            )
+        )
+    return results
+
+
+def extract_questions(client, qp_pdf_bytes, status_callback=None):
+    """Extract structured question data from QP, chunking the PDF if needed.
+
+    The PDF is split into chunks sized by estimated token cost (not just page
+    count) so that even image-heavy or scanned PDFs are processed in pieces
+    that fit comfortably under Claude's 200K context window. Each chunk is
+    sent to Claude separately. If any chunk is rejected as too large, it is
+    automatically split further (and ultimately falls back to image-mode for
+    single pages). Results are merged into a single list, with page numbers
+    offset to match the original PDF and duplicate question numbers across
+    chunk boundaries de-duplicated.
+    """
+    total_pages = get_pdf_page_count(qp_pdf_bytes)
+    if total_pages > MAX_TOTAL_PAGES:
+        raise InputTooLargeError(
+            f"This PDF has {total_pages} pages, which exceeds the maximum of "
+            f"{MAX_TOTAL_PAGES} we can process in one run. Please split it into "
+            f"smaller files (for example, one paper per upload) and try again."
+        )
+
+    # Build chunks based on estimated token cost
+    chunks = build_size_aware_chunks(qp_pdf_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK)
+    all_questions = []
+    seen_numbers = set()
+
+    if status_callback:
+        status_callback(
+            f"📑 Question paper split into {len(chunks)} chunk(s) for processing."
+        )
+
+    for i, (chunk_bytes, start_page, end_page, est_tokens) in enumerate(chunks):
+        if status_callback:
+            status_callback(
+                f"📖 Reading question paper — chunk {i + 1}/{len(chunks)} "
+                f"(pages {start_page}–{end_page}, ~{est_tokens:,} tokens)..."
+            )
+        results = process_chunk_with_adaptive_split(
+            client, chunk_bytes, EXTRACTION_PROMPT,
+            max_tokens=8000, start_page=start_page,
+            status_callback=status_callback
+        )
+
+        for text, sub_start_page in results:
+            try:
+                data = parse_json_from_text(text)
+            except json.JSONDecodeError:
+                if status_callback:
+                    status_callback(
+                        f"⚠️  Couldn't parse JSON from chunk at page {sub_start_page}, skipping."
+                    )
+                continue
+
+            for q in data.get("questions", []):
+                # Page numbers from each chunk are 1-indexed within that chunk;
+                # convert them to absolute page numbers in the original PDF.
+                local_page = q.get("page", 1)
+                q["page"] = sub_start_page + (local_page - 1)
+
+                # De-duplicate by question number (in case a question straddles
+                # the boundary between two chunks).
+                qnum = q.get("number")
+                if qnum is None or qnum in seen_numbers:
+                    continue
+                seen_numbers.add(qnum)
+                all_questions.append(q)
+
+    # Sort by question number for safety
+    all_questions.sort(key=lambda q: q.get("number", 0))
+    return all_questions
 
 def extract_answers(client, ms_pdf_bytes, status_callback=None):
-    """Extract answer key from Mark Scheme."""
+    """Extract answer key from Mark Scheme, chunking the PDF if needed."""
+    total_pages = get_pdf_page_count(ms_pdf_bytes)
+    if total_pages > MAX_TOTAL_PAGES:
+        raise InputTooLargeError(
+            f"The mark scheme has {total_pages} pages, which exceeds the maximum "
+            f"of {MAX_TOTAL_PAGES} we can process in one run."
+        )
+
+    chunks = build_size_aware_chunks(ms_pdf_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK)
+    answers = {}
+
     if status_callback:
-        status_callback("Asking Claude to read the mark scheme...")
-    text = call_claude_with_pdf(client, ms_pdf_bytes, ANSWERS_PROMPT, max_tokens=2000)
-    data = parse_json_from_text(text)
-    return data.get("answers", {})
+        status_callback(
+            f"📑 Mark scheme split into {len(chunks)} chunk(s) for processing."
+        )
+
+    for i, (chunk_bytes, start_page, end_page, est_tokens) in enumerate(chunks):
+        if status_callback:
+            status_callback(
+                f"📖 Reading mark scheme — chunk {i + 1}/{len(chunks)} "
+                f"(pages {start_page}–{end_page}, ~{est_tokens:,} tokens)..."
+            )
+        results = process_chunk_with_adaptive_split(
+            client, chunk_bytes, ANSWERS_PROMPT,
+            max_tokens=2000, start_page=start_page,
+            status_callback=status_callback
+        )
+
+        for text, sub_start_page in results:
+            try:
+                data = parse_json_from_text(text)
+            except json.JSONDecodeError:
+                if status_callback:
+                    status_callback(
+                        f"⚠️  Couldn't parse mark scheme chunk at page {sub_start_page}, skipping."
+                    )
+                continue
+
+            for qnum, ans in data.get("answers", {}).items():
+                # Don't overwrite if we already have this answer from an earlier chunk.
+                if qnum not in answers:
+                    answers[qnum] = ans
+
+    return answers
 
 def read_classifications(xlsx_bytes):
     """Read chapter / difficulty / reference from the Excel sheet."""
@@ -517,12 +874,48 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
             log_box.info(msg)
 
         with st.spinner("Working..."):
+            # Quick upfront check so the user sees what's about to happen
+            try:
+                qp_pages = get_pdf_page_count(qp_bytes)
+                ms_pages = get_pdf_page_count(ms_bytes)
+                qp_total_tokens = estimate_pdf_tokens(qp_bytes)
+                ms_total_tokens = estimate_pdf_tokens(ms_bytes)
+
+                # Warn upfront if the input looks unusually large.
+                # 200K is the hard limit; 800K total means several chunks needed.
+                if qp_total_tokens > 800_000 or ms_total_tokens > 800_000:
+                    st.warning(
+                        f"⚠️ Your files are large: estimated ~{qp_total_tokens:,} tokens "
+                        f"for the QP and ~{ms_total_tokens:,} tokens for the MS. "
+                        f"Each is well over Claude's 200K-token limit, so the app will "
+                        f"split them into many small chunks. **This will take longer "
+                        f"and cost more API credits than usual.** If you'd rather not, "
+                        f"cancel and re-upload smaller / lower-resolution PDFs."
+                    )
+
+                qp_chunks_preview = build_size_aware_chunks(
+                    qp_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
+                )
+                ms_chunks_preview = build_size_aware_chunks(
+                    ms_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
+                )
+                update_status(
+                    f"📊 Question Paper: {qp_pages} pages, ~{qp_total_tokens:,} tokens "
+                    f"→ {len(qp_chunks_preview)} chunk(s). "
+                    f"Mark Scheme: {ms_pages} pages, ~{ms_total_tokens:,} tokens "
+                    f"→ {len(ms_chunks_preview)} chunk(s)."
+                )
+            except InputTooLargeError:
+                raise  # Surface this with the standard handler below
+            except Exception:
+                pass  # Non-fatal; continue regardless
+
             update_status("📖 Extracting questions from question paper...")
-            questions = extract_questions(client, qp_bytes)
+            questions = extract_questions(client, qp_bytes, status_callback=update_status)
 
             update_status(f"✓ Found {len(questions)} questions.")
             update_status("📖 Extracting answers from mark scheme...")
-            answers = extract_answers(client, ms_bytes)
+            answers = extract_answers(client, ms_bytes, status_callback=update_status)
 
             update_status(f"✓ Got {len(answers)} answers.")
             update_status("📖 Reading classification sheet...")
@@ -552,8 +945,40 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
             use_container_width=True
         )
 
+    except InputTooLargeError as e:
+        st.error("❌ **The input is too large for Claude to process.**")
+        st.warning(str(e))
+        st.info(
+            "💡 **What this means and how to fix it:**\n\n"
+            "Claude has a 200,000-token limit per request. The app already splits "
+            "your PDFs into small chunks before sending them, so this error usually "
+            "means a **single page** of your PDF is too dense (very high-resolution "
+            "scans or many embedded images on one page).\n\n"
+            "**Try one of these:**\n\n"
+            "1. **Reduce PDF image quality.** Open your PDF in any tool that has "
+            "a 'Reduce file size' or 'Optimize PDF' option (Adobe Acrobat, "
+            "Smallpdf, ILovePDF, PDF24). Re-export at lower resolution and re-upload.\n"
+            "2. **Split the PDF into smaller files.** Upload one exam at a time "
+            "instead of a combined file containing multiple papers.\n"
+            "3. **Convert to text-based PDF.** If your PDF is a scanned image, "
+            "run it through OCR first (most PDF tools have a 'Make searchable / OCR' "
+            "option). Text-based PDFs use ~10x fewer tokens than scanned ones."
+        )
     except anthropic.AuthenticationError:
         st.error("❌ Invalid API key. Please check your Anthropic API key.")
+    except anthropic.BadRequestError as e:
+        # Catch any size errors that slipped past our adaptive splitter
+        if is_too_large_error(e):
+            st.error("❌ **The input is too large for Claude to process.**")
+            st.warning(
+                "Even after splitting your PDF into single pages and falling back "
+                "to image-based extraction, Claude rejected the request. This is rare.\n\n"
+                "**Most likely cause:** your PDF has very high-resolution scanned content. "
+                "Try re-saving the PDF with reduced image quality (any PDF tool that has "
+                "a 'Reduce file size' or 'Optimize PDF' option will work) and upload it again."
+            )
+        else:
+            st.error(f"❌ API error: {e}")
     except json.JSONDecodeError as e:
         st.error(f"❌ Couldn't parse Claude's response as JSON. Try again. Error: {e}")
     except Exception as e:
