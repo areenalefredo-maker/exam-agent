@@ -457,6 +457,14 @@ def extract_questions(client, qp_pdf_bytes, status_callback=None):
 
     # Sort by question number for safety
     all_questions.sort(key=lambda q: q.get("number", 0))
+
+    # Tag each question with its 1-indexed position in the QP. The user's
+    # spreadsheet is read in row order, and we look up classifications by
+    # this position rather than by the printed Q# (which can be ambiguous
+    # if the spreadsheet has typos in the Q# column).
+    for i, q in enumerate(all_questions):
+        q["position"] = i + 1
+
     return all_questions
 
 def extract_answers(client, ms_pdf_bytes, status_callback=None):
@@ -505,10 +513,29 @@ def extract_answers(client, ms_pdf_bytes, status_callback=None):
 
     return answers
 
-def read_classifications(xlsx_bytes):
-    """Read chapter / difficulty / reference from the Excel sheet."""
+def read_classifications(xlsx_bytes, qp_file_name=None):
+    """Read chapter / difficulty / reference from the Excel sheet.
+
+    The Excel sheet is read **in row order** — the first row corresponds to
+    the first question in the QP, the second row to the second question, and
+    so on. The 'Question No.' column is IGNORED for keying because user-prepared
+    spreadsheets often contain typos in question numbers (e.g. multiple rows
+    incorrectly labeled Q#=1).
+
+    Args:
+        xlsx_bytes: Raw bytes of the uploaded Excel file.
+        qp_file_name: If given, only rows whose 'File Name' column matches this
+            (case-insensitive, file-extension-stripped) are returned BEFORE
+            sequential numbering is assigned. This handles spreadsheets that
+            contain rows from multiple exam papers.
+
+    Returns:
+        A dict mapping sequential 1-indexed position (int) to a dict with keys
+        'chapter', 'difficulty', and 'reference'. The position corresponds to
+        the question's position in the QP (1 = first question, 2 = second, etc.),
+        NOT to the value in the 'Question No.' column.
+    """
     df = pd.read_excel(io.BytesIO(xlsx_bytes))
-    # Normalize column names (case-insensitive matching)
     cols = {c.lower().strip(): c for c in df.columns}
 
     def find_col(*candidates):
@@ -517,26 +544,58 @@ def read_classifications(xlsx_bytes):
                 return cols[c.lower()]
         return None
 
-    qnum_col = find_col("Question No.", "Question No", "Question", "Q", "Q#", "QNum")
     chapter_col = find_col("Topic", "Chapter", "Subject", "Unit")
     diff_col = find_col("Difficulty", "Level", "Level of question")
     ref_col = find_col("Reference", "Date", "Year")
+    file_col = find_col("File Name", "FileName", "File", "Source")
+
+    # Filter by file name first (so the position-counter only counts kept rows).
+    target_name = None
+    if qp_file_name and file_col:
+        target_name = _normalize_filename(qp_file_name)
 
     classifications = {}
-    if qnum_col is None:
-        return classifications
+    position = 0  # 1-indexed position assigned in row order
 
     for _, row in df.iterrows():
-        try:
-            qnum = int(float(str(row[qnum_col]).strip()))
-        except (ValueError, TypeError):
-            continue
-        classifications[qnum] = {
-            "chapter": str(row[chapter_col]) if chapter_col else "",
-            "difficulty": str(row[diff_col]) if diff_col else "Medium",
+        if target_name is not None:
+            row_file = _normalize_filename(str(row[file_col]))
+            if row_file != target_name and target_name not in row_file and row_file not in target_name:
+                continue
+
+        position += 1
+        classifications[position] = {
+            "chapter": str(row[chapter_col]).strip() if chapter_col else "",
+            "difficulty": str(row[diff_col]).strip() if diff_col else "Medium",
             "reference": str(row[ref_col]).strip() if ref_col else "",
         }
     return classifications
+
+
+def _normalize_filename(name):
+    """Normalize a filename for comparison.
+
+    Handles common variations between how a file is named on disk vs how it's
+    referenced in the spreadsheet:
+      - case differences ("Biology" vs "biology")
+      - file extensions (.pdf, .docx)
+      - underscores vs spaces ("Higher_level" vs "Higher level")
+      - dashes ("-" vs "_")
+      - "Copy" / "Copy 2" / etc. suffixes added by file managers
+      - trailing/leading whitespace
+    """
+    name = str(name).strip().lower()
+    # Strip common file extensions
+    for ext in (".pdf", ".docx", ".doc"):
+        if name.endswith(ext):
+            name = name[:-len(ext)]
+    # Replace underscores and dashes with spaces
+    name = name.replace("_", " ").replace("-", " ")
+    # Remove "copy" suffixes that some file managers append
+    name = re.sub(r"\s+copy(\s+\d+)?$", "", name)
+    # Collapse all whitespace to single spaces
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
 
 # ---------------------------- Image Extraction ----------------------------
 
@@ -625,10 +684,15 @@ def add_blank(doc, size=11):
     return p
 
 def add_lined_blank(doc):
-    """Add a paragraph with a bottom border (for student solution lines)."""
+    """Add a single writing line (paragraph with a bottom border).
+
+    Note: kept for backward-compatibility. New code should prefer
+    add_writing_lines_table() which produces more reliable output across
+    Word and LibreOffice renderers.
+    """
     p = doc.add_paragraph()
-    p.paragraph_format.space_before = Pt(3)
-    p.paragraph_format.space_after = Pt(3)
+    p.paragraph_format.space_before = Pt(8)
+    p.paragraph_format.space_after = Pt(8)
     pPr = p._p.get_or_add_pPr()
     pBdr = OxmlElement("w:pBdr")
     bottom = OxmlElement("w:bottom")
@@ -638,8 +702,41 @@ def add_lined_blank(doc):
     bottom.set(qn("w:color"), "BFBFBF")
     pBdr.append(bottom)
     pPr.append(pBdr)
-    add_run(p, "", size=11)
+    add_run(p, "\u00A0", size=11)
     return p
+
+
+def add_writing_lines_table(doc, num_lines):
+    """Add a single-column table with `num_lines` rows, where each row's
+    bottom border draws one writing line. This renders reliably in both
+    Word and LibreOffice (unlike empty-paragraph + border, which collapses).
+    """
+    from docx.shared import Cm
+    table = doc.add_table(rows=num_lines, cols=1)
+    table.autofit = False
+    # Make the table span the full text width
+    for row in table.rows:
+        row.height = Cm(0.9)  # ~25 points per line — enough room to write
+        cell = row.cells[0]
+        # Set cell width (approximately 6.5" = page width minus 1" margins)
+        cell.width = Inches(6.5)
+        # Configure cell borders: only show the bottom border
+        tc = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        tcBorders = OxmlElement("w:tcBorders")
+        for side in ("top", "left", "right"):
+            b = OxmlElement(f"w:{side}")
+            b.set(qn("w:val"), "nil")
+            tcBorders.append(b)
+        bottom = OxmlElement("w:bottom")
+        bottom.set(qn("w:val"), "single")
+        bottom.set(qn("w:sz"), "4")
+        bottom.set(qn("w:color"), "BFBFBF")
+        tcBorders.append(bottom)
+        tcPr.append(tcBorders)
+        # Empty paragraph in the cell
+        cell.paragraphs[0].add_run("")
+    return table
 
 def add_question_header(doc, q_num, level, marks, reference, chapter, page_break=False):
     """Add the standard question header block."""
@@ -685,12 +782,14 @@ def add_image(doc, pil_image, max_width_inches=5.0):
     width = Inches(max_width_inches)
     run.add_picture(buf, width=width)
 
+# Number of blank lines printed under "Student's Solution:" for the student to write in.
+STUDENT_SOLUTION_LINES = 4
+
 def add_student_solution_section(doc):
     p = doc.add_paragraph()
     p.paragraph_format.space_before = Pt(10)
     add_run(p, "Student's Solution:", bold=True, size=11)
-    for _ in range(5):
-        add_lined_blank(doc)
+    add_writing_lines_table(doc, STUDENT_SOLUTION_LINES)
 
 def add_answer_section(doc, answer, motivation):
     p_hr = doc.add_paragraph()
@@ -712,6 +811,106 @@ def add_answer_section(doc, answer, motivation):
     p_hr3 = doc.add_paragraph()
     add_horizontal_rule(p_hr3)
 
+# ---------------------------- Sorting Helpers ----------------------------
+
+# Difficulty ordering: Easy questions first within each chapter, then Medium, then Hard.
+DIFFICULTY_ORDER = {
+    "easy": 0,
+    "medium": 1,
+    "hard": 2,
+    "difficult": 2,
+}
+
+def difficulty_rank(diff_str):
+    """Map a difficulty string to a sort key. Unknown values sort last."""
+    return DIFFICULTY_ORDER.get((diff_str or "").strip().lower(), 99)
+
+
+def chapter_sort_key(chapter_str):
+    """Extract a sortable key from a chapter string.
+
+    Tries to find a leading number (e.g. "ch1. Cell Biology", "1. Atomic Structure",
+    "Chapter 3 - Genetics") so chapters sort numerically. Falls back to the raw
+    string for chapters without a number.
+
+    Returns (numeric_key, original_text) so chapters with numbers sort by number
+    first, then alphabetically, and chapters without numbers go to the end.
+    """
+    if not chapter_str:
+        return (9999, "")
+    # Strip common prefixes and find the first integer in the string
+    text = chapter_str.strip()
+    match = re.search(r"\d+", text)
+    if match:
+        return (int(match.group()), text.lower())
+    return (9999, text.lower())
+
+
+def year_sort_key(reference_str):
+    """Extract a year from a reference string for sorting.
+
+    References look like "(May 2021)", "8825-6220 (31 October 2025)", "May 2023",
+    "2024", etc. We extract the first 4-digit number that looks like a year
+    (1900-2099). Returns 0 for missing/unparseable references so they sort first
+    (treated as "no year info").
+    """
+    if not reference_str:
+        return 0
+    match = re.search(r"\b(19|20)\d{2}\b", reference_str)
+    return int(match.group()) if match else 0
+
+
+def sort_questions_for_worksheet(questions, classifications, default_reference=""):
+    """Sort questions in worksheet display order.
+
+    Order: Chapter (numeric) → Difficulty (Easy → Medium → Hard) → Year (oldest first)
+    → Position in extraction order (stable tiebreak).
+
+    Returns a new list. Does not modify the input.
+    """
+    def key(q):
+        qnum = q.get("number", 0)
+        position = q.get("position", qnum)
+        cls = classifications.get(position, {})
+        chapter = (cls.get("chapter") or "—").strip()
+        difficulty = (cls.get("difficulty") or "Medium").strip()
+        reference = (cls.get("reference") or default_reference or "").strip()
+        return (
+            chapter_sort_key(chapter),
+            difficulty_rank(difficulty),
+            year_sort_key(reference),
+            position,  # stable tiebreak by extraction order
+        )
+    return sorted(questions, key=key)
+
+
+def add_chapter_heading(doc, chapter_text, page_break=True):
+    """Add a large, centered chapter heading paragraph."""
+    p = doc.add_paragraph()
+    if page_break:
+        p.paragraph_format.page_break_before = True
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    p.paragraph_format.space_before = Pt(20)
+    p.paragraph_format.space_after = Pt(20)
+    run = p.add_run(chapter_text)
+    run.font.name = "Arial"
+    run.font.size = Pt(20)
+    run.font.bold = True
+
+
+def add_difficulty_subheading(doc, difficulty_text):
+    """Add a smaller subheading for the difficulty group within a chapter."""
+    p = doc.add_paragraph()
+    p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    p.paragraph_format.space_before = Pt(12)
+    p.paragraph_format.space_after = Pt(8)
+    run = p.add_run(f"— {difficulty_text} questions —")
+    run.font.name = "Arial"
+    run.font.size = Pt(13)
+    run.font.bold = True
+    run.font.italic = True
+
+
 MOTIVATIONS = [
     "Keep up the momentum!", "Success is within reach.", "Knowledge is power.",
     "Stay focused and positive.", "You are a fast learner.", "Every challenge is an opportunity.",
@@ -725,7 +924,22 @@ MOTIVATIONS = [
 ]
 
 def build_document(questions, answers, classifications, qp_pdf_bytes, client, status_callback=None, default_reference="", figure_cache=None):
-    """Build the final DOCX from extracted data."""
+    """Build the final DOCX from extracted data.
+
+    Questions are organized into the worksheet in this order:
+      1. By chapter (numeric, 1, 2, 3, ...)
+      2. Within each chapter, by difficulty (Easy → Medium → Hard)
+      3. Within each difficulty group, by year (oldest first)
+      4. Original question number as tiebreak
+
+    Each chapter starts on a new page with a chapter heading. Difficulty groups
+    inside a chapter are introduced with a smaller subheading.
+
+    The `classifications` dict is keyed by 1-indexed POSITION (Excel row order),
+    NOT by the question number printed in the QP. This is because the user's
+    spreadsheet may contain typos in the Q# column. We assume the spreadsheet
+    rows are in the same order as the questions appear in the QP.
+    """
     doc = Document()
 
     # Page setup: US Letter, 1" margins
@@ -742,6 +956,12 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
     style.font.name = "Arial"
     style.font.size = Pt(11)
 
+    # Tag each question with a 1-indexed position in extraction order. This is
+    # how we'll look up its classification (chapter/difficulty/reference), not
+    # by the printed Q# which may be ambiguous if the spreadsheet has typos.
+    for i, q in enumerate(questions):
+        q.setdefault("position", i + 1)
+
     # Build a map of which questions share figures
     shared_figures = {}  # q_num -> primary_q_num (the one that has the actual figure)
     for q in questions:
@@ -753,21 +973,54 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
     if figure_cache is None:
         figure_cache = {}
 
-    for idx, q in enumerate(questions):
+    # Sort the questions for worksheet display order
+    sorted_questions = sort_questions_for_worksheet(
+        questions, classifications, default_reference=default_reference
+    )
+
+    # Walk the sorted list and emit chapter / difficulty headings as we go.
+    # We track the "current" chapter and difficulty so we only emit a heading
+    # when one of them changes.
+    current_chapter = None
+    current_difficulty = None
+    is_first_block = True  # so the very first chapter doesn't get a leading page break
+
+    for idx, q in enumerate(sorted_questions):
         q_num = q["number"]
-        cls = classifications.get(q_num, {})
-        difficulty = cls.get("difficulty", "Medium").strip() or "Medium"
-        chapter = cls.get("chapter", "").strip() or "—"
-        reference = cls.get("reference", "").strip() or default_reference
+        position = q.get("position", q_num)  # fall back to q_num if missing
+        cls = classifications.get(position, {})
+        difficulty = (cls.get("difficulty") or "Medium").strip() or "Medium"
+        chapter = (cls.get("chapter") or "—").strip() or "—"
+        reference = (cls.get("reference") or "").strip() or default_reference
         answer = answers.get(str(q_num), "—")
         motivation = MOTIVATIONS[idx % len(MOTIVATIONS)]
 
         if status_callback:
-            status_callback(f"Building question {q_num}/{len(questions)}...")
+            status_callback(
+                f"Building question {idx + 1}/{len(sorted_questions)} "
+                f"(Q{q_num}, {chapter}, {difficulty})..."
+            )
+
+        # Emit a chapter heading when the chapter changes
+        if chapter != current_chapter:
+            add_chapter_heading(doc, chapter, page_break=not is_first_block)
+            current_chapter = chapter
+            current_difficulty = None  # reset so we re-emit the difficulty heading
+            is_first_block = False
+            # Also force a page break before the first question in this chapter
+            question_needs_page_break = False  # the chapter heading already broke
+        else:
+            question_needs_page_break = True
+
+        # Emit a difficulty subheading when the difficulty changes within a chapter
+        if difficulty != current_difficulty:
+            add_difficulty_subheading(doc, difficulty)
+            current_difficulty = difficulty
+            question_needs_page_break = False  # subheading flows into the question
 
         add_question_header(
             doc, q_num, difficulty, 1, reference, chapter,
-            page_break=(idx > 0)
+            page_break=question_needs_page_break
         )
 
         # Body text
@@ -919,8 +1172,28 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
 
             update_status(f"✓ Got {len(answers)} answers.")
             update_status("📖 Reading classification sheet...")
-            classifications = read_classifications(xlsx_bytes)
-            update_status(f"✓ Got classifications for {len(classifications)} questions.")
+            classifications = read_classifications(xlsx_bytes, qp_file_name=qp_file.name)
+            update_status(f"✓ Got classifications for {len(classifications)} questions (matched to '{qp_file.name}').")
+
+            # Show a quick breakdown of how questions will be organized
+            from collections import Counter
+            chapter_counts = Counter()
+            for i, q in enumerate(questions):
+                position = q.get("position", i + 1)
+                cls = classifications.get(position, {})
+                ch = (cls.get("chapter") or "—").strip() or "Uncategorized"
+                chapter_counts[ch] += 1
+            if chapter_counts:
+                breakdown = " · ".join(
+                    f"{ch} ({n})" for ch, n in sorted(
+                        chapter_counts.items(),
+                        key=lambda x: chapter_sort_key(x[0])
+                    )
+                )
+                update_status(f"📚 Chapter breakdown: {breakdown}")
+                update_status(
+                    "📑 Worksheet will be sorted by Chapter → Difficulty (Easy→Medium→Hard) → Year."
+                )
 
             update_status("🖼️ Building document (this is the slow part — extracting figures)...")
             doc = build_document(
