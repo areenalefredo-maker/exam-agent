@@ -37,6 +37,254 @@ st.caption("Upload your exam files → AI processes them → Download a formatte
 # ---------------------------- Helpers ----------------------------
 MODEL = "claude-sonnet-4-5"
 
+def clean_latex_text(text):
+    """Convert simple LaTeX math notation in spreadsheet cells to readable text.
+
+    Spreadsheets prepared with LaTeX-style math (e.g. ``$O_2$``, ``$1.2 \\times 10^{24}$``,
+    ``$Br^-$``) need to be converted to readable Unicode for the worksheet output,
+    since python-docx doesn't render LaTeX. This is a best-effort conversion that
+    handles the most common chemistry/math patterns. Anything we can't convert is
+    left in place, with the surrounding ``$`` markers stripped.
+
+    Conversions performed:
+      - Subscripts: ``X_2``, ``X_{12}`` → ``X₂``, ``X₁₂`` (digit subscripts only)
+      - Superscripts: ``X^2``, ``X^{2+}``, ``X^-`` → ``X²``, ``X²⁺``, ``X⁻``
+      - Common operators: ``\\times`` → ``×``, ``\\rightarrow`` → ``→``, ``\\circ`` → ``°``
+      - Fractions: ``\\frac{a}{b}`` → ``a/b``
+      - Greek letters: ``\\alpha`` → ``α``, etc.
+      - Strip remaining LaTeX control sequences and ``$`` markers
+    """
+    if not text or not isinstance(text, str):
+        return text
+
+    s = text
+
+    # First: replace common LaTeX operators and symbols. Order matters — do
+    # multi-char replacements before single-char ones, and do these BEFORE
+    # super/subscript expansion so that things like "40^{\circ}C" → "40°C"
+    # work (otherwise the °  ends up trapped inside ^{...} which is then
+    # converted to a superscript).
+    replacements = {
+        r"\\times": "×",
+        r"\\cdot": "·",
+        r"\\div": "÷",
+        r"\\pm": "±",
+        r"\\mp": "∓",
+        r"\\rightarrow": "→",
+        r"\\leftarrow": "←",
+        r"\\Rightarrow": "⇒",
+        r"\\leftrightarrow": "↔",
+        r"\\to": "→",
+        r"\\circ": "°",
+        r"\\degree": "°",
+        r"\\infty": "∞",
+        r"\\leq": "≤",
+        r"\\geq": "≥",
+        r"\\neq": "≠",
+        r"\\approx": "≈",
+        r"\\sim": "~",
+        r"\\equiv": "≡",
+        r"\\sqrt": "√",
+        r"\\Delta": "Δ", r"\\delta": "δ",
+        r"\\alpha": "α", r"\\beta": "β", r"\\gamma": "γ",
+        r"\\theta": "θ", r"\\lambda": "λ", r"\\mu": "μ",
+        r"\\pi": "π", r"\\sigma": "σ", r"\\omega": "ω",
+        r"\\Omega": "Ω", r"\\Sigma": "Σ", r"\\Phi": "Φ",
+        r"\\ominus": "⊖", r"\\oplus": "⊕",
+    }
+    for pattern, replacement in replacements.items():
+        s = re.sub(pattern, replacement, s)
+
+    # Strip the `^{X}` wrapper around already-substituted symbols. After the
+    # operator substitutions above, "40^{°}C" is "40^{°}C"; we want "40°C".
+    # We strip ^{...} when its content is already a single Unicode symbol.
+    s = re.sub(r"\^\{(°|×|÷|±|∓|→|←|⇒|↔|⊖|⊕|∞|·|√)\}", r"\1", s)
+
+    # Now subscripts and superscripts (digits/sign/parens only).
+    sub_map = str.maketrans("0123456789+-=()", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎")
+    s = re.sub(r"_\{([0-9+\-=()]+)\}", lambda m: m.group(1).translate(sub_map), s)
+    s = re.sub(r"_([0-9])", lambda m: m.group(1).translate(sub_map), s)
+
+    sup_map = str.maketrans("0123456789+-=()n", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
+    s = re.sub(r"\^\{([0-9+\-=()n]+)\}", lambda m: m.group(1).translate(sup_map), s)
+    s = re.sub(r"\^([0-9+\-n])", lambda m: m.group(1).translate(sup_map), s)
+
+    # Fractions: \frac{a}{b} → (a)/(b) (best-effort, single-level)
+    s = re.sub(r"\\frac\{([^{}]*)\}\{([^{}]*)\}", r"(\1)/(\2)", s)
+
+    # \text{X} / \mathrm{X} → X (preserve content)
+    s = re.sub(r"\\text\{([^{}]*)\}", r"\1", s)
+    s = re.sub(r"\\mathrm\{([^{}]*)\}", r"\1", s)
+
+    # Strip $ math delimiters
+    s = s.replace("$", "")
+
+    # Strip any remaining \xxx commands we didn't recognize
+    s = re.sub(r"\\[a-zA-Z]+", "", s)
+
+    # Markdown bold around question numbers: **5.** → 5.
+    s = re.sub(r"\*\*(\d+\.)\*\*", r"\1", s)
+
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def parse_question_from_excel_row(row, position):
+    """Build a question dict from a spreadsheet row.
+
+    Returns the same shape as extract_questions returns (number, body, options,
+    page, has_figure, etc.) so build_document can consume either source.
+
+    Detects when a question has missing/empty options (e.g. "A.\\nB.\\nC.\\nD.")
+    and marks it as needing a figure placeholder, so the user knows to insert
+    the figure manually after downloading.
+    """
+    raw_text = str(row.get("Question Text", "") or "")
+
+    # Split into body lines and option lines first (before LaTeX cleaning,
+    # which collapses whitespace including newlines).
+    # Lines that begin with "A. ", "B. ", "C. ", "D. " (or "A.", "B.", etc.
+    # for figure-only options) become options.
+    lines = [l.strip() for l in raw_text.split("\n")]
+    body_lines = []
+    options = []
+    for line in lines:
+        m = re.match(r"^([A-D])\.\s*(.*)$", line)
+        if m:
+            letter, content = m.group(1), m.group(2).strip()
+            content_clean = clean_latex_text(content) if content else ""
+            options.append(f"{letter}.  {content_clean}" if content_clean else f"{letter}.")
+        elif line:
+            body_lines.append(line)
+
+    # Strip leading "**N.**" markdown numbering from the body
+    if body_lines:
+        body_lines[0] = re.sub(r"^\*\*\d+\.\*\*\s*", "", body_lines[0])
+
+    body = " ".join(body_lines).strip()
+    body = clean_latex_text(body)
+
+    # Detect when options are empty (figure-based question with image options)
+    empty_options = sum(1 for o in options if re.match(r"^[A-D]\.$", o.strip())) >= 3
+    # Detect when the body contains a markdown table (also a figure indicator)
+    has_table_in_body = "|" in body and re.search(r"\|.{1,30}\|", body) is not None
+
+    needs_figure_placeholder = empty_options or has_table_in_body
+
+    # If the body has a markdown-style table, strip it and flag for placeholder
+    if has_table_in_body:
+        body = re.sub(r"\|[^|\n]*\|", "", body).strip()
+        body = re.sub(r"\s+", " ", body)
+
+    qnum_raw = row.get("Question No.", position)
+    try:
+        qnum = int(qnum_raw) if not pd.isna(qnum_raw) else position
+    except (ValueError, TypeError):
+        qnum = position
+
+    page_raw = row.get("Page Number", 1)
+    try:
+        page = int(page_raw) if not pd.isna(page_raw) else 1
+    except (ValueError, TypeError):
+        page = 1
+
+    return {
+        "number": qnum,
+        "position": position,
+        "body": body,
+        "options": options,
+        "page": page,
+        "has_figure": needs_figure_placeholder,
+        "needs_manual_figure": needs_figure_placeholder,
+        "figure_position": "between_body_and_options",
+    }
+
+
+def extract_answer_from_mark_scheme_cell(cell):
+    """Extract a single answer letter (A-D) from a Mark Scheme cell.
+
+    Cell values look like: "1) D", "MCQ) A", "A-D) B", "C", "A. ...".
+    We find the first standalone uppercase letter A-D after stripping
+    common prefixes.
+    """
+    if cell is None or pd.isna(cell):
+        return None
+    s = str(cell).strip()
+    # Strip common prefixes: "1)", "1.", "MCQ)", "A-D)"
+    s = re.sub(r"^(MCQ|A-D|\d+)[\)\.]\s*", "", s, flags=re.IGNORECASE)
+    # Find first standalone A-D
+    m = re.match(r"\s*([A-D])\b", s)
+    return m.group(1) if m else None
+
+
+def extract_questions_from_excel(xlsx_bytes, qp_file_name=None, status_callback=None):
+    """Read questions, options, and answers directly from the spreadsheet.
+
+    This is an alternative to extract_questions() / extract_answers() that
+    bypasses the Claude API entirely. It's faster, free, and avoids PDF token
+    limit errors — but requires the spreadsheet to contain the full question
+    text and mark scheme letters in the appropriate columns.
+
+    Returns a tuple (questions, answers) where:
+      - questions is a list of dicts in the same shape as extract_questions
+      - answers is a dict {str(qnum): "A"|"B"|"C"|"D"}
+    """
+    df = pd.read_excel(io.BytesIO(xlsx_bytes))
+    cols = {c.lower().strip(): c for c in df.columns}
+
+    def find_col(*candidates):
+        for c in candidates:
+            if c.lower() in cols:
+                return cols[c.lower()]
+        return None
+
+    text_col = find_col("Question Text", "Question", "Text")
+    ms_col = find_col("Mark Scheme", "Answer", "MS")
+    file_col = find_col("File Name", "FileName", "File", "Source")
+
+    if text_col is None:
+        raise ValueError(
+            "The spreadsheet doesn't have a 'Question Text' column. "
+            "Cannot extract questions from Excel."
+        )
+
+    target_name = None
+    if qp_file_name and file_col:
+        target_name = _normalize_filename(qp_file_name)
+
+    questions = []
+    answers = {}
+    position = 0
+
+    for _, row in df.iterrows():
+        if target_name is not None:
+            row_file = _normalize_filename(str(row[file_col]))
+            if row_file != target_name and target_name not in row_file and row_file not in target_name:
+                continue
+
+        position += 1
+        q = parse_question_from_excel_row(row, position)
+        questions.append(q)
+
+        if ms_col is not None:
+            ans = extract_answer_from_mark_scheme_cell(row[ms_col])
+            if ans:
+                # Key answers by both the printed Q# and the position so either
+                # lookup works in build_document.
+                answers[str(q["number"])] = ans
+                answers[f"pos:{position}"] = ans
+
+    if status_callback:
+        figure_count = sum(1 for q in questions if q.get("needs_manual_figure"))
+        status_callback(
+            f"📑 Extracted {len(questions)} questions from spreadsheet. "
+            f"{figure_count} need a figure inserted manually."
+        )
+
+    return questions, answers
+
+
 # ---------------------------- PDF Chunking ----------------------------
 # Claude's context window is 200K tokens. PDFs sent as documents are token-heavy
 # because Claude processes each page as both text AND an image. Empirically,
@@ -798,6 +1046,59 @@ def add_image(doc, pil_image, max_width_inches=5.0):
     width = Inches(max_width_inches)
     run.add_picture(buf, width=width)
 
+
+def add_figure_placeholder(doc, q_num):
+    """Add a visible placeholder box where a figure or table should be inserted.
+
+    Used when the question has an associated figure but we couldn't extract it
+    automatically (e.g. when running in Excel-only mode with no PDF access).
+    The user can then paste a screenshot or insert an image into this placeholder
+    after downloading the document.
+    """
+    table = doc.add_table(rows=1, cols=1)
+    table.autofit = False
+    cell = table.rows[0].cells[0]
+    cell.width = Inches(6.5)
+
+    # Configure cell borders: a dashed border on all sides to make the
+    # placeholder visually distinct from the writing-line tables.
+    tc = cell._tc
+    tcPr = tc.get_or_add_tcPr()
+    tcBorders = OxmlElement("w:tcBorders")
+    for side in ("top", "bottom", "left", "right"):
+        b = OxmlElement(f"w:{side}")
+        b.set(qn("w:val"), "dashed")
+        b.set(qn("w:sz"), "8")
+        b.set(qn("w:color"), "808080")
+        tcBorders.append(b)
+    tcPr.append(tcBorders)
+
+    # Vertical centering and a bit of padding inside the cell
+    vAlign = OxmlElement("w:vAlign")
+    vAlign.set(qn("w:val"), "center")
+    tcPr.append(vAlign)
+    tcMar = OxmlElement("w:tcMar")
+    for side in ("top", "bottom"):
+        m = OxmlElement(f"w:{side}")
+        m.set(qn("w:w"), "240")  # 240 twips = ~12pt
+        m.set(qn("w:type"), "dxa")
+        tcMar.append(m)
+    tcPr.append(tcMar)
+
+    # Friendly label centered in the box
+    p = cell.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run(f"📷  [Insert figure / table for Q{q_num} here]")
+    run.font.name = "Arial"
+    run.font.size = Pt(11)
+    run.font.italic = True
+    run.font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+    # Add a small spacing paragraph after the placeholder
+    spacer = doc.add_paragraph()
+    spacer.paragraph_format.space_after = Pt(4)
+
+
 # Number of blank lines printed under "Student's Solution:" for the student to write in.
 STUDENT_SOLUTION_LINES = 4
 
@@ -1008,7 +1309,14 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
         difficulty = (cls.get("difficulty") or "Medium").strip() or "Medium"
         chapter = (cls.get("chapter") or "—").strip() or "—"
         reference = (cls.get("reference") or "").strip() or default_reference
-        answer = answers.get(str(q_num), "—")
+        # Look up the answer first by question number, then by position as a
+        # fallback. The Excel-extraction path keys answers by both, so either
+        # lookup works there. The PDF-extraction path only uses qnum.
+        answer = (
+            answers.get(str(q_num))
+            or answers.get(f"pos:{position}")
+            or "—"
+        )
         motivation = MOTIVATIONS[idx % len(MOTIVATIONS)]
 
         if status_callback:
@@ -1046,14 +1354,22 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
 
         figure_position = q.get("figure_position", "after_options")
         has_figure = q.get("has_figure", False)
+        needs_manual = q.get("needs_manual_figure", False)
         is_shared_consumer = q_num in shared_figures
 
-        # Determine which figure to use
+        # Determine which figure to use. Three cases:
+        #   1. We already have an extracted figure cached → use it
+        #   2. We have a Claude client and a PDF to extract from → call Claude
+        #   3. Excel-based extraction with no figure available → emit a
+        #      placeholder paragraph so the user knows where to paste a figure
         figure_image = None
-        if has_figure:
+        if has_figure and not needs_manual:
             page_index = q.get("page", 1) - 1
             try:
                 if q_num not in figure_cache:
+                    if client is None or not qp_pdf_bytes:
+                        # No way to extract — fall through to placeholder logic
+                        raise RuntimeError("no client or PDF available")
                     figure_cache[q_num] = crop_figure_for_question(
                         client, qp_pdf_bytes, page_index, q_num,
                         q.get("figure_description", "the figure")
@@ -1062,18 +1378,25 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
             except Exception as e:
                 if status_callback:
                     status_callback(f"⚠️ Couldn't extract figure for Q{q_num}: {e}")
+                needs_manual = True
 
-        # Insert figure based on position (before options is the default for a single figure)
-        if figure_image and figure_position in ("before_body", "between_body_and_options"):
-            add_image(doc, figure_image)
+        # Insert figure (or placeholder) based on position
+        def emit_figure_or_placeholder():
+            if figure_image:
+                add_image(doc, figure_image)
+            elif needs_manual:
+                add_figure_placeholder(doc, q_num)
+
+        if (figure_image or needs_manual) and figure_position in ("before_body", "between_body_and_options"):
+            emit_figure_or_placeholder()
 
         # Options
         for opt in q.get("options", []):
             add_option(doc, opt)
 
         # Figure after options
-        if figure_image and figure_position == "after_options":
-            add_image(doc, figure_image)
+        if (figure_image or needs_manual) and figure_position == "after_options":
+            emit_figure_or_placeholder()
 
         # Student solution section
         add_student_solution_section(doc)
@@ -1113,25 +1436,54 @@ else:
 
 # File uploads
 st.subheader("📁 Upload Files")
+
+# Mode toggle — PDF mode (default) extracts text and figures from QP via Claude.
+# Excel-only mode bypasses the API entirely for faster/cheaper runs.
+excel_only_mode = st.toggle(
+    "📊 Use Excel sheet only (skip PDF + API, faster but figures need manual insertion)",
+    value=False,
+    help=(
+        "When OFF (default), the app uses Claude to read your QP and MS PDFs to "
+        "extract question text, options, and figures automatically. Figures are "
+        "embedded in the document.\n\n"
+        "When ON, the app reads questions, options, and answers directly from your "
+        "spreadsheet — no Claude API calls, no token-limit errors, no PDF parsing. "
+        "Faster and free, but figures get a placeholder box and you need to paste "
+        "them in manually after downloading."
+    ),
+)
+
 col1, col2 = st.columns(2)
 with col1:
-    qp_file = st.file_uploader("Question Paper (PDF)", type=["pdf"], key="qp")
+    qp_file = st.file_uploader(
+        "Question Paper (PDF)" + (" — optional in Excel-only mode" if excel_only_mode else ""),
+        type=["pdf"], key="qp",
+    )
     xlsx_file = st.file_uploader("Classification Sheet (Excel)", type=["xlsx", "xls"], key="xlsx")
 with col2:
-    ms_file = st.file_uploader("Mark Scheme (PDF)", type=["pdf"], key="ms")
+    ms_file = st.file_uploader(
+        "Mark Scheme (PDF)" + (" — optional in Excel-only mode" if excel_only_mode else ""),
+        type=["pdf"], key="ms",
+    )
     default_ref = st.text_input(
         "Default Reference (optional)",
         placeholder="e.g. (May 2021)",
         help="Used if the Excel doesn't include a reference column."
     )
 
-# Generate button
-ready = bool(api_key and qp_file and ms_file and xlsx_file)
+# Generate button — different requirements per mode
+if excel_only_mode:
+    ready = bool(xlsx_file)
+    if not ready:
+        st.info("⏳ Excel-only mode: just upload the spreadsheet and click Generate.")
+else:
+    ready = bool(api_key and qp_file and ms_file and xlsx_file)
+
 if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_container_width=True):
     try:
-        client = anthropic.Anthropic(api_key=api_key)
-        qp_bytes = qp_file.read()
-        ms_bytes = ms_file.read()
+        client = anthropic.Anthropic(api_key=api_key) if api_key else None
+        qp_bytes = qp_file.read() if qp_file else b""
+        ms_bytes = ms_file.read() if ms_file else b""
         xlsx_bytes = xlsx_file.read()
 
         progress_box = st.empty()
@@ -1143,54 +1495,88 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
             log_box.info(msg)
 
         with st.spinner("Working..."):
-            # Quick upfront check so the user sees what's about to happen
-            try:
-                qp_pages = get_pdf_page_count(qp_bytes)
-                ms_pages = get_pdf_page_count(ms_bytes)
-                qp_total_tokens = estimate_pdf_tokens(qp_bytes)
-                ms_total_tokens = estimate_pdf_tokens(ms_bytes)
+            if excel_only_mode:
+                # Fast path: extract everything directly from the spreadsheet.
+                # No API calls, no PDF parsing, no token limits.
+                update_status("📊 Extracting questions and answers from spreadsheet...")
+                qp_name_for_filter = qp_file.name if qp_file else None
+                questions, answers = extract_questions_from_excel(
+                    xlsx_bytes,
+                    qp_file_name=qp_name_for_filter,
+                    status_callback=update_status,
+                )
 
-                # Warn upfront if the input looks unusually large.
-                # 200K is the hard limit; 800K total means several chunks needed.
-                if qp_total_tokens > 800_000 or ms_total_tokens > 800_000:
-                    st.warning(
-                        f"⚠️ Your files are large: estimated ~{qp_total_tokens:,} tokens "
-                        f"for the QP and ~{ms_total_tokens:,} tokens for the MS. "
-                        f"Each is well over Claude's 200K-token limit, so the app will "
-                        f"split them into many small chunks. **This will take longer "
-                        f"and cost more API credits than usual.** If you'd rather not, "
-                        f"cancel and re-upload smaller / lower-resolution PDFs."
+                if not questions and qp_name_for_filter:
+                    # Try again without filename filter
+                    update_status(
+                        "⚠️ No rows matched the QP filename. Retrying without filename filter..."
+                    )
+                    questions, answers = extract_questions_from_excel(
+                        xlsx_bytes,
+                        qp_file_name=None,
+                        status_callback=update_status,
                     )
 
-                qp_chunks_preview = build_size_aware_chunks(
-                    qp_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
-                )
-                ms_chunks_preview = build_size_aware_chunks(
-                    ms_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
-                )
-                update_status(
-                    f"📊 Question Paper: {qp_pages} pages, ~{qp_total_tokens:,} tokens "
-                    f"→ {len(qp_chunks_preview)} chunk(s). "
-                    f"Mark Scheme: {ms_pages} pages, ~{ms_total_tokens:,} tokens "
-                    f"→ {len(ms_chunks_preview)} chunk(s)."
-                )
-            except InputTooLargeError:
-                raise  # Surface this with the standard handler below
-            except Exception:
-                pass  # Non-fatal; continue regardless
+                if not questions:
+                    st.error(
+                        "❌ Couldn't extract any questions from the spreadsheet. "
+                        "Make sure it has a 'Question Text' column with the question content."
+                    )
+                    st.stop()
 
-            update_status("📖 Extracting questions from question paper...")
-            questions = extract_questions(client, qp_bytes, status_callback=update_status)
+                update_status(f"✓ Got {len(questions)} questions and "
+                              f"{sum(1 for v in answers.values() if not v.startswith('pos:'))//1} answers.")
+            else:
+                # PDF + API extraction path (original behavior).
+                # Quick upfront check so the user sees what's about to happen
+                try:
+                    qp_pages = get_pdf_page_count(qp_bytes)
+                    ms_pages = get_pdf_page_count(ms_bytes)
+                    qp_total_tokens = estimate_pdf_tokens(qp_bytes)
+                    ms_total_tokens = estimate_pdf_tokens(ms_bytes)
 
-            update_status(f"✓ Found {len(questions)} questions.")
-            update_status("📖 Extracting answers from mark scheme...")
-            answers = extract_answers(client, ms_bytes, status_callback=update_status)
+                    # Warn upfront if the input looks unusually large.
+                    if qp_total_tokens > 800_000 or ms_total_tokens > 800_000:
+                        st.warning(
+                            f"⚠️ Your files are large: estimated ~{qp_total_tokens:,} tokens "
+                            f"for the QP and ~{ms_total_tokens:,} tokens for the MS. "
+                            f"Each is well over Claude's 200K-token limit, so the app will "
+                            f"split them into many small chunks. **This will take longer "
+                            f"and cost more API credits than usual.** If you'd rather not, "
+                            f"cancel and re-upload smaller / lower-resolution PDFs."
+                        )
 
-            update_status(f"✓ Got {len(answers)} answers.")
+                    qp_chunks_preview = build_size_aware_chunks(
+                        qp_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
+                    )
+                    ms_chunks_preview = build_size_aware_chunks(
+                        ms_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
+                    )
+                    update_status(
+                        f"📊 Question Paper: {qp_pages} pages, ~{qp_total_tokens:,} tokens "
+                        f"→ {len(qp_chunks_preview)} chunk(s). "
+                        f"Mark Scheme: {ms_pages} pages, ~{ms_total_tokens:,} tokens "
+                        f"→ {len(ms_chunks_preview)} chunk(s)."
+                    )
+                except InputTooLargeError:
+                    raise  # Surface this with the standard handler below
+                except Exception:
+                    pass  # Non-fatal; continue regardless
+
+                update_status("📖 Extracting questions from question paper...")
+                questions = extract_questions(client, qp_bytes, status_callback=update_status)
+
+                update_status(f"✓ Found {len(questions)} questions.")
+                update_status("📖 Extracting answers from mark scheme...")
+                answers = extract_answers(client, ms_bytes, status_callback=update_status)
+
+                update_status(f"✓ Got {len(answers)} answers.")
+
+            # Read classifications regardless of mode (Excel column lookup is the same).
             update_status("📖 Reading classification sheet...")
             classifications = read_classifications(
                 xlsx_bytes,
-                qp_file_name=qp_file.name,
+                qp_file_name=qp_file.name if qp_file else None,
                 status_callback=update_status,
             )
 
