@@ -133,19 +133,26 @@ def clean_latex_text(text):
 def parse_question_from_excel_row(row, position):
     """Build a question dict from a spreadsheet row.
 
-    Returns the same shape as extract_questions returns (number, body, options,
-    page, has_figure, etc.) so build_document can consume either source.
+    The spreadsheet is the AUTHORITATIVE source for question text, options,
+    classification, marks, answer, and motivational quote. PDF extraction is
+    only used (optionally) to pull figures into questions where the spreadsheet
+    indicates a figure is missing.
 
-    Detects when a question has missing/empty options (e.g. "A.\\nB.\\nC.\\nD.")
-    and marks it as needing a figure placeholder, so the user knows to insert
-    the figure manually after downloading.
+    Detects two special states:
+      - extraction_failed: the row is a placeholder marker like "Extraction
+        Failed (AI missed target)" — skip it or render as an error stub.
+      - needs_figure_placeholder: the row's options are blank or its body
+        contains a markdown table, meaning the QP has a figure here that
+        couldn't fit in the spreadsheet text. The Word output will draw a
+        dashed placeholder box so the user can paste the figure manually.
     """
-    raw_text = str(row.get("Question Text", "") or "")
+    raw_text = str(row.get("Question Text", "") or "").strip()
+
+    # Detect "Extraction Failed" rows up front
+    extraction_failed = bool(re.search(r"extraction\s+failed", raw_text, re.IGNORECASE))
 
     # Split into body lines and option lines first (before LaTeX cleaning,
     # which collapses whitespace including newlines).
-    # Lines that begin with "A. ", "B. ", "C. ", "D. " (or "A.", "B.", etc.
-    # for figure-only options) become options.
     lines = [l.strip() for l in raw_text.split("\n")]
     body_lines = []
     options = []
@@ -189,12 +196,27 @@ def parse_question_from_excel_row(row, position):
     except (ValueError, TypeError):
         page = 1
 
+    marks_raw = row.get("Marks", 1)
+    try:
+        marks = int(marks_raw) if not pd.isna(marks_raw) else 1
+    except (ValueError, TypeError):
+        marks = 1
+
+    quote = ""
+    if "Quote" in row.index:
+        q_val = row.get("Quote", "")
+        if not pd.isna(q_val):
+            quote = str(q_val).strip()
+
     return {
         "number": qnum,
         "position": position,
         "body": body,
         "options": options,
         "page": page,
+        "marks": marks,
+        "quote": quote,
+        "extraction_failed": extraction_failed,
         "has_figure": needs_figure_placeholder,
         "needs_manual_figure": needs_figure_placeholder,
         "figure_position": "between_body_and_options",
@@ -256,6 +278,7 @@ def extract_questions_from_excel(xlsx_bytes, qp_file_name=None, status_callback=
     questions = []
     answers = {}
     position = 0
+    skipped_failed = 0
 
     for _, row in df.iterrows():
         if target_name is not None:
@@ -265,6 +288,13 @@ def extract_questions_from_excel(xlsx_bytes, qp_file_name=None, status_callback=
 
         position += 1
         q = parse_question_from_excel_row(row, position)
+
+        # Skip rows that are flagged as "Extraction Failed" — don't fabricate
+        # a question for them; the user will see the count in the status log.
+        if q.get("extraction_failed"):
+            skipped_failed += 1
+            continue
+
         questions.append(q)
 
         if ms_col is not None:
@@ -277,10 +307,13 @@ def extract_questions_from_excel(xlsx_bytes, qp_file_name=None, status_callback=
 
     if status_callback:
         figure_count = sum(1 for q in questions if q.get("needs_manual_figure"))
-        status_callback(
+        msg = (
             f"📑 Extracted {len(questions)} questions from spreadsheet. "
             f"{figure_count} need a figure inserted manually."
         )
+        if skipped_failed:
+            msg += f" Skipped {skipped_failed} 'Extraction Failed' row(s)."
+        status_callback(msg)
 
     return questions, answers
 
@@ -872,40 +905,65 @@ def render_page_image(pdf_bytes, page_index, dpi=200):
     doc.close()
     return img
 
-FIGURE_BOUNDS_PROMPT = """This is page {page} of an exam paper. Find the bounding box of the figure/diagram/graph/chart for Question {qnum}.
+FIGURE_BOUNDS_PROMPT = """This is page {page} of an exam paper.
 
-Description of the figure: {description}
+I'm trying to find the figure (diagram, graph, chart, chemical structure, or
+table) that belongs to a specific multiple-choice question. The question's text is:
 
-Return JSON only:
-{{"top_pct": 0.0, "left_pct": 0.0, "bottom_pct": 1.0, "right_pct": 1.0}}
+----
+{question_text}
+----
 
-All values are percentages (0.0 to 1.0) of the page dimensions.
-- top_pct: y-coordinate of the top of the figure (0 = page top)
-- bottom_pct: y-coordinate of the bottom of the figure (1 = page bottom)
-- left_pct, right_pct: similar for horizontal extent
+Look at the page carefully. Does this page contain a figure that matches the
+question above?
 
-Return tight bounds around ONLY the figure, excluding question text, options, and headers.
-Return ONLY the JSON, no preamble.
+Reply with ONLY a JSON object in one of these two formats:
+
+If the page DOES contain a clearly-matching figure for this question:
+{{"found": true, "top_pct": 0.0, "left_pct": 0.0, "bottom_pct": 1.0, "right_pct": 1.0}}
+
+If the page does NOT contain a matching figure, or you're not sure which one
+matches, or there are multiple figures and you can't tell which belongs to
+THIS question:
+{{"found": false}}
+
+Bounding box coordinates are percentages (0.0 to 1.0) of the page. Crop tightly
+around ONLY the figure — do not include question text, options, or other questions'
+content. Return ONLY the JSON, no preamble.
 """
 
-def crop_figure_for_question(client, pdf_bytes, page_index, qnum, description):
-    """Use Claude vision to identify and crop the figure for a question."""
+def crop_figure_for_question(client, pdf_bytes, page_index, qnum, description, question_text=""):
+    """Use Claude vision to identify and crop the figure for a question.
+
+    Returns a cropped PIL Image if Claude is confident the figure matches the
+    question's content, or None if no clear match was found. The caller should
+    use a placeholder when None is returned, rather than falling back to a
+    whole-page image which is almost always wrong content.
+    """
     page_img = render_page_image(pdf_bytes, page_index, dpi=200)
 
-    # Send the page image to Claude to get bounds
+    # Send the page image to Claude with the question text as context
     buf = io.BytesIO()
     page_img.save(buf, format="PNG")
-    bounds_text = call_claude_with_image(
-        client,
-        buf.getvalue(),
-        FIGURE_BOUNDS_PROMPT.format(page=page_index + 1, qnum=qnum, description=description),
-        max_tokens=300
+    prompt_text = FIGURE_BOUNDS_PROMPT.format(
+        page=page_index + 1,
+        question_text=question_text or description or f"Question {qnum}",
     )
+    try:
+        bounds_text = call_claude_with_image(
+            client, buf.getvalue(), prompt_text, max_tokens=300
+        )
+    except Exception:
+        return None
+
     try:
         bounds = parse_json_from_text(bounds_text)
     except Exception:
-        # Fallback: return the whole page
-        return page_img
+        return None
+
+    # If Claude says no figure found / not confident, return None — caller uses placeholder
+    if not bounds.get("found", False):
+        return None
 
     w, h = page_img.size
     left = max(0, int(bounds.get("left_pct", 0.05) * w))
@@ -913,11 +971,19 @@ def crop_figure_for_question(client, pdf_bytes, page_index, qnum, description):
     right = min(w, int(bounds.get("right_pct", 0.95) * w))
     bottom = min(h, int(bounds.get("bottom_pct", 1) * h))
 
-    # Sanity check
+    # Sanity checks: bounds must be valid AND tighter than the whole page
+    # (a "whole-page" crop is almost always wrong content for this question).
     if right <= left or bottom <= top:
-        return page_img
-    if (right - left) < 100 or (bottom - top) < 50:
-        return page_img
+        return None
+    crop_width = right - left
+    crop_height = bottom - top
+    if crop_width < 100 or crop_height < 50:
+        return None
+    # Reject crops that cover most of the page — those usually mean Claude
+    # gave up and pointed at the whole question, including the wrong options
+    # or even multiple questions.
+    if crop_width / w > 0.95 and crop_height / h > 0.85:
+        return None
 
     return page_img.crop((left, top, right, bottom))
 
@@ -1317,7 +1383,11 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
             or answers.get(f"pos:{position}")
             or "—"
         )
-        motivation = MOTIVATIONS[idx % len(MOTIVATIONS)]
+        # Use the Quote from Excel if present, otherwise cycle through the
+        # default motivation pool.
+        motivation = q.get("quote") or MOTIVATIONS[idx % len(MOTIVATIONS)]
+        # Use marks from Excel if present, otherwise default to 1
+        marks = q.get("marks", 1)
 
         if status_callback:
             status_callback(
@@ -1343,7 +1413,7 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
             question_needs_page_break = False  # subheading flows into the question
 
         add_question_header(
-            doc, q_num, difficulty, 1, reference, chapter,
+            doc, q_num, difficulty, marks, reference, chapter,
             page_break=question_needs_page_break
         )
 
@@ -1357,28 +1427,36 @@ def build_document(questions, answers, classifications, qp_pdf_bytes, client, st
         needs_manual = q.get("needs_manual_figure", False)
         is_shared_consumer = q_num in shared_figures
 
-        # Determine which figure to use. Three cases:
-        #   1. We already have an extracted figure cached → use it
-        #   2. We have a Claude client and a PDF to extract from → call Claude
-        #   3. Excel-based extraction with no figure available → emit a
-        #      placeholder paragraph so the user knows where to paste a figure
+        # Figure handling. The question text (from Excel) is the AUTHORITATIVE
+        # description. We pass it to Claude vision so the API call can verify
+        # that the figure on the PDF page actually matches THIS question, not
+        # just "any figure on the page". Claude returns None if it can't
+        # identify a clear match — in that case we draw a placeholder box so
+        # the user can paste the right figure manually. We never embed a
+        # whole-page screenshot or guess at content.
         figure_image = None
-        if has_figure and not needs_manual:
+        if has_figure and client is not None and qp_pdf_bytes:
             page_index = q.get("page", 1) - 1
+            cache_key = ("fig", q_num, position)
             try:
-                if q_num not in figure_cache:
-                    if client is None or not qp_pdf_bytes:
-                        # No way to extract — fall through to placeholder logic
-                        raise RuntimeError("no client or PDF available")
-                    figure_cache[q_num] = crop_figure_for_question(
+                if cache_key not in figure_cache:
+                    figure_cache[cache_key] = crop_figure_for_question(
                         client, qp_pdf_bytes, page_index, q_num,
-                        q.get("figure_description", "the figure")
+                        q.get("figure_description", ""),
+                        question_text=q.get("body", ""),
                     )
-                figure_image = figure_cache[q_num]
+                figure_image = figure_cache[cache_key]
             except Exception as e:
                 if status_callback:
-                    status_callback(f"⚠️ Couldn't extract figure for Q{q_num}: {e}")
-                needs_manual = True
+                    status_callback(f"⚠️ Figure extraction failed for Q{q_num}: {e}")
+                figure_image = None
+
+        # If we asked for a figure but didn't get one back, mark it as needing
+        # a manual placeholder. This handles two cases:
+        #   - User disabled figure extraction (client is None) → always placeholder
+        #   - Claude wasn't confident about which figure matches → placeholder
+        if has_figure and figure_image is None:
+            needs_manual = True
 
         # Insert figure (or placeholder) based on position
         def emit_figure_or_placeholder():
@@ -1437,47 +1515,58 @@ else:
 # File uploads
 st.subheader("📁 Upload Files")
 
-# Mode toggle — PDF mode (default) extracts text and figures from QP via Claude.
-# Excel-only mode bypasses the API entirely for faster/cheaper runs.
-excel_only_mode = st.toggle(
-    "📊 Use Excel sheet only (skip PDF + API, faster but figures need manual insertion)",
-    value=False,
+st.markdown(
+    "**The Excel sheet is the source of truth** for question text, options, "
+    "answers, and classification. The QP PDF is only used to extract figures "
+    "(diagrams, graphs, tables) for questions that need them."
+)
+
+# Mode toggle — controls whether figures are auto-extracted from the QP.
+extract_figures = st.toggle(
+    "🖼️ Extract figures automatically from the QP PDF (uses Claude API)",
+    value=True,
     help=(
-        "When OFF (default), the app uses Claude to read your QP and MS PDFs to "
-        "extract question text, options, and figures automatically. Figures are "
-        "embedded in the document.\n\n"
-        "When ON, the app reads questions, options, and answers directly from your "
-        "spreadsheet — no Claude API calls, no token-limit errors, no PDF parsing. "
-        "Faster and free, but figures get a placeholder box and you need to paste "
-        "them in manually after downloading."
+        "When ON (default), the app uses Claude to find and crop figures from "
+        "the QP PDF for questions that have empty options or table content in "
+        "the spreadsheet. Requires an API key.\n\n"
+        "When OFF, the app skips figure extraction and inserts a placeholder "
+        "box you can paste a figure into manually."
     ),
 )
 
 col1, col2 = st.columns(2)
 with col1:
+    xlsx_file = st.file_uploader(
+        "Classification Sheet (Excel) — REQUIRED",
+        type=["xlsx", "xls"], key="xlsx",
+    )
     qp_file = st.file_uploader(
-        "Question Paper (PDF)" + (" — optional in Excel-only mode" if excel_only_mode else ""),
+        "Question Paper (PDF)" + (" — required for figure extraction" if extract_figures else " — optional"),
         type=["pdf"], key="qp",
     )
-    xlsx_file = st.file_uploader("Classification Sheet (Excel)", type=["xlsx", "xls"], key="xlsx")
 with col2:
-    ms_file = st.file_uploader(
-        "Mark Scheme (PDF)" + (" — optional in Excel-only mode" if excel_only_mode else ""),
-        type=["pdf"], key="ms",
-    )
     default_ref = st.text_input(
         "Default Reference (optional)",
         placeholder="e.g. (May 2021)",
         help="Used if the Excel doesn't include a reference column."
     )
+    ms_file = st.file_uploader(
+        "Mark Scheme (PDF) — optional, only used as backup if Excel is missing answers",
+        type=["pdf"], key="ms",
+    )
 
-# Generate button — different requirements per mode
-if excel_only_mode:
-    ready = bool(xlsx_file)
+# Generate button — Excel is always required, others depend on mode
+ready = bool(xlsx_file)
+if extract_figures and not (qp_file and api_key):
     if not ready:
-        st.info("⏳ Excel-only mode: just upload the spreadsheet and click Generate.")
-else:
-    ready = bool(api_key and qp_file and ms_file and xlsx_file)
+        st.info("⏳ Upload the Excel sheet to begin.")
+    elif not qp_file:
+        st.info("⏳ Figure extraction is on — please upload the QP PDF or turn it off.")
+    elif not api_key:
+        st.info("⏳ Figure extraction is on — please provide an API key or turn it off.")
+    ready = bool(xlsx_file and qp_file and api_key)
+elif not ready:
+    st.info("⏳ Upload the Excel sheet to begin.")
 
 if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_container_width=True):
     try:
@@ -1485,6 +1574,7 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
         qp_bytes = qp_file.read() if qp_file else b""
         ms_bytes = ms_file.read() if ms_file else b""
         xlsx_bytes = xlsx_file.read()
+        qp_filename = qp_file.name if qp_file else None
 
         progress_box = st.empty()
         log_box = st.empty()
@@ -1495,130 +1585,58 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
             log_box.info(msg)
 
         with st.spinner("Working..."):
-            if excel_only_mode:
-                # Fast path: extract everything directly from the spreadsheet.
-                # No API calls, no PDF parsing, no token limits.
-                update_status("📊 Extracting questions and answers from spreadsheet...")
-                qp_name_for_filter = qp_file.name if qp_file else None
-                questions, answers = extract_questions_from_excel(
-                    xlsx_bytes,
-                    qp_file_name=qp_name_for_filter,
-                    status_callback=update_status,
-                )
-
-                if not questions and qp_name_for_filter:
-                    # Try again without filename filter
-                    update_status(
-                        "⚠️ No rows matched the QP filename. Retrying without filename filter..."
-                    )
-                    questions, answers = extract_questions_from_excel(
-                        xlsx_bytes,
-                        qp_file_name=None,
-                        status_callback=update_status,
-                    )
-
-                if not questions:
-                    st.error(
-                        "❌ Couldn't extract any questions from the spreadsheet. "
-                        "Make sure it has a 'Question Text' column with the question content."
-                    )
-                    st.stop()
-
-                update_status(f"✓ Got {len(questions)} questions and "
-                              f"{sum(1 for v in answers.values() if not v.startswith('pos:'))//1} answers.")
-            else:
-                # PDF + API extraction path (original behavior).
-                # Quick upfront check so the user sees what's about to happen
-                try:
-                    qp_pages = get_pdf_page_count(qp_bytes)
-                    ms_pages = get_pdf_page_count(ms_bytes)
-                    qp_total_tokens = estimate_pdf_tokens(qp_bytes)
-                    ms_total_tokens = estimate_pdf_tokens(ms_bytes)
-
-                    # Warn upfront if the input looks unusually large.
-                    if qp_total_tokens > 800_000 or ms_total_tokens > 800_000:
-                        st.warning(
-                            f"⚠️ Your files are large: estimated ~{qp_total_tokens:,} tokens "
-                            f"for the QP and ~{ms_total_tokens:,} tokens for the MS. "
-                            f"Each is well over Claude's 200K-token limit, so the app will "
-                            f"split them into many small chunks. **This will take longer "
-                            f"and cost more API credits than usual.** If you'd rather not, "
-                            f"cancel and re-upload smaller / lower-resolution PDFs."
-                        )
-
-                    qp_chunks_preview = build_size_aware_chunks(
-                        qp_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
-                    )
-                    ms_chunks_preview = build_size_aware_chunks(
-                        ms_bytes, target_tokens=TARGET_TOKENS_PER_CHUNK
-                    )
-                    update_status(
-                        f"📊 Question Paper: {qp_pages} pages, ~{qp_total_tokens:,} tokens "
-                        f"→ {len(qp_chunks_preview)} chunk(s). "
-                        f"Mark Scheme: {ms_pages} pages, ~{ms_total_tokens:,} tokens "
-                        f"→ {len(ms_chunks_preview)} chunk(s)."
-                    )
-                except InputTooLargeError:
-                    raise  # Surface this with the standard handler below
-                except Exception:
-                    pass  # Non-fatal; continue regardless
-
-                update_status("📖 Extracting questions from question paper...")
-                questions = extract_questions(client, qp_bytes, status_callback=update_status)
-
-                update_status(f"✓ Found {len(questions)} questions.")
-                update_status("📖 Extracting answers from mark scheme...")
-                answers = extract_answers(client, ms_bytes, status_callback=update_status)
-
-                update_status(f"✓ Got {len(answers)} answers.")
-
-            # Read classifications regardless of mode (Excel column lookup is the same).
-            update_status("📖 Reading classification sheet...")
-            classifications = read_classifications(
+            # STEP 1 — Always extract questions from Excel. The Excel is the
+            # authoritative source for question text, options, answers, and
+            # classification. Nothing in this flow ever overwrites Excel content
+            # with PDF-extracted text.
+            update_status("📊 Reading questions from spreadsheet...")
+            questions, answers = extract_questions_from_excel(
                 xlsx_bytes,
-                qp_file_name=qp_file.name if qp_file else None,
+                qp_file_name=qp_filename,
                 status_callback=update_status,
             )
 
-            # If filtering by File Name returned nothing, the spreadsheet is
-            # either for a different QP, OR the user's spreadsheet doesn't have
-            # a 'File Name' column / has it filled with different values. Try a
-            # fallback that ignores file-name filtering and warn the user.
-            if not classifications:
-                fallback = read_classifications(
+            # If filtering by filename matched nothing, retry without filter and warn
+            if not questions and qp_filename:
+                update_status(
+                    "⚠️ No rows matched the QP filename. Retrying without filename filter..."
+                )
+                questions, answers = extract_questions_from_excel(
                     xlsx_bytes,
                     qp_file_name=None,
                     status_callback=update_status,
                 )
-                if fallback:
+                if questions:
                     st.warning(
-                        f"⚠️ **No spreadsheet rows matched the uploaded QP file name** "
-                        f"`{qp_file.name}`.\n\n"
-                        f"The spreadsheet has {len(fallback)} rows. The 'File Name' "
-                        f"column values in the spreadsheet didn't match the uploaded "
-                        f"QP's filename, so the chapter / difficulty / reference data "
-                        f"can't be matched correctly.\n\n"
-                        f"**The worksheet will still be generated**, but **without "
-                        f"chapter, difficulty, or reference info** for each question.\n\n"
-                        f"**To fix this:** make sure the spreadsheet's 'File Name' "
-                        f"column contains a value that matches your QP's filename "
-                        f"(spaces, underscores, and `.pdf` extension are handled "
-                        f"automatically). For example, if your QP is "
-                        f"`Chemistry Paper 1.pdf`, the spreadsheet should have "
-                        f"`Chemistry Paper 1` (or similar) in the File Name column."
-                    )
-                    # Use the fallback so the user at least gets *something*.
-                    classifications = fallback
-                else:
-                    st.error(
-                        "❌ The spreadsheet appears to be empty or doesn't have "
-                        "the expected columns (Topic, Difficulty, Reference)."
+                        f"⚠️ The QP filename `{qp_filename}` didn't match any "
+                        f"value in the spreadsheet's 'File Name' column. Used "
+                        f"all rows from the spreadsheet instead. If this isn't "
+                        f"what you wanted, rename your QP file to match the "
+                        f"'File Name' column in the Excel."
                     )
 
-            update_status(
-                f"✓ Got classifications for {len(classifications)} questions "
-                f"(matched to '{qp_file.name}')."
+            if not questions:
+                st.error(
+                    "❌ Couldn't extract any questions from the spreadsheet. "
+                    "Make sure it has a 'Question Text' column with content."
+                )
+                st.stop()
+
+            update_status(f"✓ Got {len(questions)} questions from the spreadsheet.")
+
+            # STEP 2 — Read classifications from Excel (chapter/difficulty/reference).
+            update_status("📖 Reading classifications from spreadsheet...")
+            classifications = read_classifications(
+                xlsx_bytes,
+                qp_file_name=qp_filename,
+                status_callback=update_status,
             )
+            if not classifications and qp_filename:
+                classifications = read_classifications(
+                    xlsx_bytes, qp_file_name=None, status_callback=update_status,
+                )
+
+            update_status(f"✓ Got classifications for {len(classifications)} positions.")
 
             # Show a quick breakdown of how questions will be organized
             from collections import Counter
@@ -1640,10 +1658,32 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
                     "📑 Worksheet will be sorted by Chapter → Difficulty (Easy→Medium→Hard) → Year."
                 )
 
-            update_status("🖼️ Building document (this is the slow part — extracting figures)...")
+            # If the user disabled figure extraction (or doesn't have a QP),
+            # don't pass the API client to build_document — it will fall back
+            # to placeholder boxes for any question marked as needing a figure.
+            doc_client = client if (extract_figures and qp_bytes) else None
+
+            if extract_figures and not qp_bytes:
+                st.warning(
+                    "⚠️ Figure extraction is enabled but no QP PDF was uploaded. "
+                    "Placeholder boxes will be used instead."
+                )
+
+            figure_count = sum(1 for q in questions if q.get("needs_manual_figure"))
+            if figure_count and doc_client:
+                update_status(
+                    f"🖼️ Building document and extracting {figure_count} figure(s) "
+                    f"from the QP (this is the slow part — uses Claude vision)..."
+                )
+            else:
+                update_status(
+                    f"📝 Building document ({figure_count} figure placeholder(s) "
+                    f"will be inserted for figures you'll need to paste in manually)..."
+                )
+
             doc = build_document(
                 questions, answers, classifications,
-                qp_bytes, client,
+                qp_bytes, doc_client,
                 status_callback=update_status,
                 default_reference=default_ref
             )
