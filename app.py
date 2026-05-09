@@ -297,7 +297,7 @@ def build_word_document(questions: list[dict]) -> bytes:
             add_run(diff_para, f"— {diff} questions —", italic=True, color="666666", size_pt=11)
 
             for q in diffs[diff]:
-                qn       = q["qn"]
+                q_num    = q["qn"]          # renamed: avoids shadowing docx's qn() function
                 stem     = latex_to_text(q.get("text", ""))
                 opt_a    = latex_to_text(q.get("A", ""))
                 opt_b    = latex_to_text(q.get("B", ""))
@@ -315,7 +315,7 @@ def build_word_document(questions: list[dict]) -> bytes:
 
                 # Question header
                 qh = doc.add_paragraph()
-                add_run(qh, f"Question: {qn}", bold=True, color="1F4E79", size_pt=13)
+                add_run(qh, f"Question: {q_num}", bold=True, color="1F4E79", size_pt=13)
 
                 # Meta line
                 meta = doc.add_paragraph()
