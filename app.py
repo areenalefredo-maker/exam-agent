@@ -513,7 +513,7 @@ def extract_answers(client, ms_pdf_bytes, status_callback=None):
 
     return answers
 
-def read_classifications(xlsx_bytes, qp_file_name=None):
+def read_classifications(xlsx_bytes, qp_file_name=None, status_callback=None):
     """Read chapter / difficulty / reference from the Excel sheet.
 
     The Excel sheet is read **in row order** — the first row corresponds to
@@ -528,6 +528,9 @@ def read_classifications(xlsx_bytes, qp_file_name=None):
             (case-insensitive, file-extension-stripped) are returned BEFORE
             sequential numbering is assigned. This handles spreadsheets that
             contain rows from multiple exam papers.
+        status_callback: Optional function called with diagnostic messages
+            about which columns were detected and how many rows were kept.
+            Useful for surfacing column-name mismatches in the UI.
 
     Returns:
         A dict mapping sequential 1-indexed position (int) to a dict with keys
@@ -548,6 +551,19 @@ def read_classifications(xlsx_bytes, qp_file_name=None):
     diff_col = find_col("Difficulty", "Level", "Level of question")
     ref_col = find_col("Reference", "Date", "Year")
     file_col = find_col("File Name", "FileName", "File", "Source")
+
+    # Diagnostic: report which columns were detected so the user can see if
+    # any expected column is missing from their spreadsheet.
+    if status_callback:
+        status_callback(
+            f"📋 Excel columns detected — "
+            f"Chapter: {chapter_col!r}, "
+            f"Difficulty: {diff_col!r}, "
+            f"Reference: {ref_col!r}, "
+            f"File Name: {file_col!r}"
+        )
+        all_cols = list(df.columns)
+        status_callback(f"📋 All columns in your spreadsheet: {all_cols}")
 
     # Filter by file name first (so the position-counter only counts kept rows).
     target_name = None
@@ -1172,8 +1188,51 @@ if st.button("🚀 Generate Worksheet", disabled=not ready, type="primary", use_
 
             update_status(f"✓ Got {len(answers)} answers.")
             update_status("📖 Reading classification sheet...")
-            classifications = read_classifications(xlsx_bytes, qp_file_name=qp_file.name)
-            update_status(f"✓ Got classifications for {len(classifications)} questions (matched to '{qp_file.name}').")
+            classifications = read_classifications(
+                xlsx_bytes,
+                qp_file_name=qp_file.name,
+                status_callback=update_status,
+            )
+
+            # If filtering by File Name returned nothing, the spreadsheet is
+            # either for a different QP, OR the user's spreadsheet doesn't have
+            # a 'File Name' column / has it filled with different values. Try a
+            # fallback that ignores file-name filtering and warn the user.
+            if not classifications:
+                fallback = read_classifications(
+                    xlsx_bytes,
+                    qp_file_name=None,
+                    status_callback=update_status,
+                )
+                if fallback:
+                    st.warning(
+                        f"⚠️ **No spreadsheet rows matched the uploaded QP file name** "
+                        f"`{qp_file.name}`.\n\n"
+                        f"The spreadsheet has {len(fallback)} rows. The 'File Name' "
+                        f"column values in the spreadsheet didn't match the uploaded "
+                        f"QP's filename, so the chapter / difficulty / reference data "
+                        f"can't be matched correctly.\n\n"
+                        f"**The worksheet will still be generated**, but **without "
+                        f"chapter, difficulty, or reference info** for each question.\n\n"
+                        f"**To fix this:** make sure the spreadsheet's 'File Name' "
+                        f"column contains a value that matches your QP's filename "
+                        f"(spaces, underscores, and `.pdf` extension are handled "
+                        f"automatically). For example, if your QP is "
+                        f"`Chemistry Paper 1.pdf`, the spreadsheet should have "
+                        f"`Chemistry Paper 1` (or similar) in the File Name column."
+                    )
+                    # Use the fallback so the user at least gets *something*.
+                    classifications = fallback
+                else:
+                    st.error(
+                        "❌ The spreadsheet appears to be empty or doesn't have "
+                        "the expected columns (Topic, Difficulty, Reference)."
+                    )
+
+            update_status(
+                f"✓ Got classifications for {len(classifications)} questions "
+                f"(matched to '{qp_file.name}')."
+            )
 
             # Show a quick breakdown of how questions will be organized
             from collections import Counter
