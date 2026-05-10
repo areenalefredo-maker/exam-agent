@@ -1,3 +1,9 @@
+"""
+IB Exam Worksheet Generator
+- QP PDF  → questions, options, tables, diagrams, graphs (verbatim)
+- MS PDF  → answers only
+- Excel   → question numbers, chapter, difficulty, marks, quotes
+"""
 import streamlit as st
 import anthropic
 import openpyxl
@@ -5,15 +11,21 @@ import json
 import re
 import io
 import base64
-import fitz                          # PyMuPDF — PDF → image
+
+import fitz                           # PyMuPDF — PDF inspection + rendering
 from PIL import Image
+
 from docx import Document
-from docx.shared import Pt, RGBColor, Inches, Cm
+from docx.shared import Pt, Cm, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn as docx_qn   # renamed → never shadowed
+from docx.enum.table import WD_ROW_HEIGHT_RULE
+from docx.oxml.ns import qn as docx_qn
 from docx.oxml import OxmlElement
 
-# ─── Page config ──────────────────────────────────────────────────────────────
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  STREAMLIT UI
+# ═══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
     page_title="Exam Worksheet Generator",
     page_icon="📄",
@@ -21,35 +33,33 @@ st.set_page_config(
 )
 
 st.title("📄 Exam Worksheet Generator")
-st.caption("Questions from QP · Answers from MS · Metadata from Excel")
+st.caption("QP PDF → questions · MS PDF → answers · Excel → metadata")
 
 with st.expander("ℹ️ Source rules", expanded=False):
-    st.markdown("""
-| Source | Used for |
-|--------|----------|
-| **QP PDF** | Question text, options, tables, diagrams, graphs — verbatim |
-| **MS PDF** | Answers only |
-| **Excel** | Question numbers, chapter, difficulty, marks, quotes |
+    st.markdown(
+        "| Source | Used for |\n"
+        "|--------|----------|\n"
+        "| **QP PDF** | Question text, options, tables, diagrams, graphs — verbatim |\n"
+        "| **MS PDF** | Answers only |\n"
+        "| **Excel** | Question numbers, chapter, difficulty, marks, quotes |\n\n"
+        "- Visual questions (graphs/diagrams/tables) → cropped image from QP, no duplicate text\n"
+        "- Excel `Topic = Error` or empty → `Unclassified`\n"
+        "- Excel `Marks = 0` or missing → `1` (standard MCQ)"
+    )
 
-- Questions with visuals → actual image cropped from QP page, embedded in Word
-- Topic = "Error" or Marks = 0 in Excel → replaced with "Unclassified" / 1
-""")
-
-# ─── File uploads ─────────────────────────────────────────────────────────────
-col1, col2 = st.columns(2)
-with col1:
+c1, c2 = st.columns(2)
+with c1:
     qp_file = st.file_uploader("📋 Question Paper (QP)", type=["pdf"], key="qp")
     ms_file = st.file_uploader("✅ Mark Scheme (MS)",     type=["pdf"], key="ms")
-with col2:
+with c2:
     xl_file = st.file_uploader("📊 Excel Sheet", type=["xlsx", "xls"], key="xl")
 
 st.divider()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════════════════════════
 def read_bytes(uploaded_file) -> bytes:
     uploaded_file.seek(0)
     return uploaded_file.read()
@@ -61,37 +71,49 @@ def to_b64(data: bytes) -> str:
 
 def safe_json(text: str):
     text = re.sub(r"```json\s*", "", text)
-    text = re.sub(r"```\s*",     "", text)
+    text = re.sub(r"```\s*", "", text)
+    text = text.strip()
+    # Try direct parse, else find the first JSON-looking substring
     try:
-        return json.loads(text.strip())
+        return json.loads(text)
     except json.JSONDecodeError:
+        for opener, closer in [("[", "]"), ("{", "}")]:
+            i = text.find(opener)
+            j = text.rfind(closer)
+            if i != -1 and j != -1 and j > i:
+                try:
+                    return json.loads(text[i:j + 1])
+                except json.JSONDecodeError:
+                    continue
         return None
 
 
-# ─── Excel parser ─────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+#  EXCEL  →  metadata only
+# ───────────────────────────────────────────────────────────────────────────────
 def parse_excel(uploaded_file) -> list[dict]:
-    """Return metadata rows from Excel.
-    Sanitises 'Error' topics and zero marks.
-    Never used for question text or answer.
+    """Read question numbers + metadata from Excel.
+    Never used for question text or answers.
+    Sanitises: 'Error'/empty topic → 'Unclassified', marks 0/missing → 1.
     """
     uploaded_file.seek(0)
     wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
     ws = wb.active
     headers = [str(c.value).strip() if c.value else "" for c in next(ws.iter_rows(max_row=1))]
 
-    def col_idx(names):
-        for name in names:
-            if name in headers:
-                return headers.index(name)
+    def col_idx(*names):
+        for n in names:
+            if n in headers:
+                return headers.index(n)
         return None
 
-    qn_idx   = col_idx(["Question No.", "Question No", "Q No", "Q#", "Question Number", "Q"]) or 2
-    page_idx = col_idx(["Page Number", "Page", "page_number"])
-    top_idx  = col_idx(["Topic", "Chapter", "topic", "chapter"])
-    dif_idx  = col_idx(["Difficulty", "difficulty"])
-    mrk_idx  = col_idx(["Marks", "marks"])
-    qut_idx  = col_idx(["Quote", "quote"])
-    ref_idx  = col_idx(["Reference", "ref"])
+    qn_idx   = col_idx("Question No.", "Question No", "Q No", "Q#", "Question Number", "Q") or 2
+    page_idx = col_idx("Page Number", "Page", "page_number")
+    top_idx  = col_idx("Topic", "Chapter", "topic", "chapter")
+    dif_idx  = col_idx("Difficulty", "difficulty")
+    mrk_idx  = col_idx("Marks", "marks")
+    qut_idx  = col_idx("Quote", "quote")
+    ref_idx  = col_idx("Reference", "ref")
 
     def cell_val(row, idx, fallback=""):
         if idx is None:
@@ -104,23 +126,22 @@ def parse_excel(uploaded_file) -> list[dict]:
 
     rows = []
     for row in ws.iter_rows(min_row=2):
-        raw_qn = list(row)[qn_idx].value
         try:
-            q_num = int(float(str(raw_qn)))
+            q_num = int(float(str(list(row)[qn_idx].value)))
         except (TypeError, ValueError):
             continue
         if q_num <= 0:
             continue
 
         topic = cell_val(row, top_idx)
-        if not topic or topic.lower() in ("error", "none", "n/a", ""):
+        if not topic or topic.strip().lower() in ("error", "none", "n/a", "nan"):
             topic = "Unclassified"
 
         try:
             marks = int(float(cell_val(row, mrk_idx, "1")))
-            if marks <= 0:
-                marks = 1
         except ValueError:
+            marks = 1
+        if marks <= 0:
             marks = 1
 
         try:
@@ -132,7 +153,7 @@ def parse_excel(uploaded_file) -> list[dict]:
             "qn":         q_num,
             "page_num":   page_num,
             "topic":      topic,
-            "difficulty": cell_val(row, dif_idx, ""),
+            "difficulty": cell_val(row, dif_idx, "Unspecified") or "Unspecified",
             "marks":      marks,
             "quote":      cell_val(row, qut_idx, ""),
             "ref":        cell_val(row, ref_idx, ""),
@@ -140,188 +161,465 @@ def parse_excel(uploaded_file) -> list[dict]:
     return rows
 
 
-# ─── Claude: extract questions from QP (verbatim) ────────────────────────────
-def extract_questions_from_qp(
-    client: anthropic.Anthropic,
-    qp_b64: str,
-    q_nums: list[int],
-) -> list[dict]:
-    nums_str = ", ".join(str(n) for n in q_nums)
-    resp = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=8000,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {"type": "base64", "media_type": "application/pdf", "data": qp_b64},
-                },
-                {
-                    "type": "text",
-                    "text": f"""Extract ONLY question numbers {nums_str} from this IB exam paper.
+# ───────────────────────────────────────────────────────────────────────────────
+#  PYMUPDF  →  find every question's bounding box
+# ───────────────────────────────────────────────────────────────────────────────
+def find_question_locations(pdf_bytes: bytes) -> dict:
+    """Scan all pages of the QP PDF and locate each question by its 'N.' marker.
+    Returns: {q_num: {"page_idx": int, "top_y": float, "bottom_y": float,
+                      "page_height": float, "page_width": float}}
+    Coordinates are in PDF points (top-left origin).
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    raw = []  # list of (q_num, page_idx, top_y, page_height, page_width)
 
-STRICT RULES — never violate:
-1. Copy text VERBATIM — do NOT paraphrase, shorten, or reword anything
-2. Include the COMPLETE question stem and all 4 options (A, B, C, D) exactly as printed
-3. For tables: represent as plain-text rows e.g.
-   "| Header1 | Header2 |\\n| Val1 | Val2 |"
-4. For equations/formulas: copy as-is (fractions, arrows, sub/superscripts)
-5. If the question contains a DIAGRAM, GRAPH, IMAGE, or ORBITAL SHAPE that cannot
-   be fully represented as text, set "hasVisual": true.
-   Do NOT describe the visual — just flag it.
-6. If a question number is NOT FOUND: set "found": false,
-   "text": "Question not found in uploaded Question Paper"
+    pat = re.compile(r"^(\d+)\.$")
 
-Return ONLY this JSON array — no markdown, no preamble:
-[{{
-  "qn": <int>,
-  "text": "<verbatim stem>",
-  "A": "<option A verbatim>",
-  "B": "<option B verbatim>",
-  "C": "<option C verbatim>",
-  "D": "<option D verbatim>",
-  "hasVisual": <bool>,
-  "found": <bool>
-}}]""",
-                },
-            ],
-        }],
-    )
-    raw = "".join(b.text for b in resp.content if hasattr(b, "text"))
-    data = safe_json(raw)
-    return data if isinstance(data, list) else []
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        ph, pw = page.rect.height, page.rect.width
+        text_dict = page.get_text("dict")
+
+        for block in text_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+
+                # Concatenate first 1-2 spans to catch "1." cleanly
+                first_text = spans[0].get("text", "").strip()
+                bbox = line["bbox"]   # (x0, y0, x1, y1)
+
+                # Question marker = "N." at left margin (x0 < 100 pt typical),
+                # font is usually bold (size ≥ 9 pt)
+                m = pat.match(first_text)
+                if not m:
+                    continue
+                if bbox[0] > 110:        # too far from left margin → not a marker
+                    continue
+
+                q_num = int(m.group(1))
+                # Ignore obviously non-question numbers (e.g. >100 unlikely)
+                if q_num < 1 or q_num > 99:
+                    continue
+
+                # Right edge of the "N." marker — used to skip the
+                # question-number column when cropping the image.
+                marker_right_x = spans[0]["bbox"][2]
+
+                raw.append((q_num, page_idx, bbox[1], ph, pw, marker_right_x))
+
+    doc.close()
+
+    # Keep only the first occurrence per question number
+    seen, ordered = set(), []
+    for entry in raw:
+        if entry[0] not in seen:
+            seen.add(entry[0])
+            ordered.append(entry)
+
+    # Sort by document order (page, then top_y)
+    ordered.sort(key=lambda e: (e[1], e[2]))
+
+    result = {}
+    for i, (qn, page_idx, top_y, ph, pw, mrx) in enumerate(ordered):
+        # Determine bottom_y: next question marker on SAME page, else page bottom
+        bottom_y = ph * 0.94          # default: avoid footer
+        for j in range(i + 1, len(ordered)):
+            nq, np_idx, ntop, _, _, _ = ordered[j]
+            if np_idx == page_idx:
+                bottom_y = ntop - 4
+                break
+            if np_idx > page_idx:
+                break
+
+        result[qn] = {
+            "page_idx":       page_idx,
+            "top_y":          top_y,
+            "bottom_y":       bottom_y,
+            "page_height":    ph,
+            "page_width":     pw,
+            "marker_right_x": mrx,   # PDF points
+        }
+    return result
 
 
-# ─── Claude: extract answers from MS ─────────────────────────────────────────
-def extract_answers_from_ms(
-    client: anthropic.Anthropic,
-    ms_b64: str,
-    q_nums: list[int],
-) -> dict:
-    nums_str = ", ".join(str(n) for n in q_nums)
-    resp = client.messages.create(
+def crop_question_png(pdf_bytes: bytes, locations: dict, q_num: int,
+                      dpi: int = 200) -> bytes | None:
+    """Crop the question area from the QP PDF and return PNG bytes."""
+    loc = locations.get(q_num)
+    if not loc:
+        return None
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page = doc[loc["page_idx"]]
+    mat = fitz.Matrix(dpi / 72, dpi / 72)
+    pix = page.get_pixmap(matrix=mat, alpha=False)
+    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    iw, ih = img.size
+    doc.close()
+
+    scale = dpi / 72
+    top_px    = max(0,  int(loc["top_y"]    * scale) - 10)
+    bottom_px = min(ih, int(loc["bottom_y"] * scale) + 5)
+
+    # Skip the question-number column ("5.") so the marker doesn't
+    # appear inside the embedded image — it's already in the heading.
+    mrx = loc.get("marker_right_x", 0)
+    left_px = max(0, int((mrx + 6) * scale)) if mrx else 0
+    right_px = iw
+
+    if bottom_px <= top_px or right_px <= left_px:
+        return None
+
+    cropped = img.crop((left_px, top_px, right_px, bottom_px))
+    buf = io.BytesIO()
+    cropped.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+#  CLAUDE  →  classify (visual?) + extract text for text-only questions
+# ───────────────────────────────────────────────────────────────────────────────
+def classify_and_extract(client: anthropic.Anthropic, qp_b64: str,
+                         q_nums: list[int],
+                         qp_bytes: bytes = None,
+                         locations: dict = None) -> list[dict]:
+    """Deterministic extraction using PyMuPDF — no Claude calls, no placeholders.
+       For each question:
+         - found:        true if located in the QP
+         - needs_image:  true if the question has visual content (drawings,
+                         images, or sparse text → use cropped image)
+         - text/A/B/C/D: extracted verbatim from the PDF for text-only questions
+                         (empty strings for visual questions)
+
+       The `client` and `qp_b64` parameters are kept for backward compatibility
+       but ignored; we use `qp_bytes` + `locations` instead.
+    """
+    if qp_bytes is None or locations is None:
+        return []
+
+    doc = fitz.open(stream=qp_bytes, filetype="pdf")
+    results = []
+
+    for q_num in q_nums:
+        loc = locations.get(q_num)
+        if not loc:
+            results.append({
+                "qn": q_num, "found": False, "needs_image": False,
+                "text": "", "A": "", "B": "", "C": "", "D": "",
+            })
+            continue
+
+        page = doc[loc["page_idx"]]
+        top_y, bottom_y = loc["top_y"], loc["bottom_y"]
+        clip = fitz.Rect(0, top_y, page.rect.width, bottom_y)
+
+        # ── Collect spans inside the question's bbox ─────────────────────────
+        # We work at the SPAN level (not the line level) so we can detect
+        # subscripts / superscripts that are encoded as smaller-font spans
+        # whose baseline is above or below the main text baseline.
+        text_dict = page.get_text("dict", clip=clip)
+
+        # First pass: gather all spans + figure out the dominant body font size
+        all_spans: list[dict] = []
+        size_counts: dict = {}
+        for block in text_dict.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    text = span.get("text", "")
+                    if not text:
+                        continue
+                    sz = round(span.get("size", 0), 1)
+                    bb = span.get("bbox", (0, 0, 0, 0))
+                    all_spans.append({
+                        "text": text,
+                        "size": sz,
+                        "x0":   bb[0],
+                        "y0":   bb[1],
+                        "y1":   bb[3],
+                        "flags": span.get("flags", 0),
+                    })
+                    if text.strip():
+                        size_counts[sz] = size_counts.get(sz, 0) + len(text.strip())
+
+        if not all_spans:
+            results.append({
+                "qn": q_num, "found": True, "needs_image": True,
+                "text": "", "A": "", "B": "", "C": "", "D": "",
+            })
+            continue
+
+        body_size = max(size_counts.items(), key=lambda kv: kv[1])[0] \
+                    if size_counts else 11.0
+
+        # Unicode tables for safe sub/superscript conversion
+        SUBS  = str.maketrans("0123456789+-=()n",
+                              "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₙ")
+        SUPS  = str.maketrans("0123456789+-=()n",
+                              "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿ")
+
+        # Track whether any sub/superscript span had characters we could
+        # NOT translate safely (e.g. letters other than 'n' in subscripts,
+        # mixed content). If yes, force image fallback to avoid distortion.
+        unsafe_sub_super = False
+
+        # ── Group spans by text line (y bucket) ──────────────────────────────
+        Y_BUCKET = 3
+        line_buckets: dict = {}
+        for sp in all_spans:
+            key = round(sp["y0"] / Y_BUCKET) * Y_BUCKET
+            line_buckets.setdefault(key, []).append(sp)
+
+        # Build full-line text WITH subscript/superscript conversion
+        rendered_lines: list[tuple] = []   # (y, x0, rendered_text)
+        for key in sorted(line_buckets):
+            spans_on_line = sorted(line_buckets[key], key=lambda s: s["x0"])
+            # Identify the dominant baseline on this line
+            full_size_spans = [s for s in spans_on_line
+                               if s["size"] >= body_size - 0.5]
+            if full_size_spans:
+                main_y0 = full_size_spans[0]["y0"]
+                main_y1 = full_size_spans[0]["y1"]
+            else:
+                main_y0 = spans_on_line[0]["y0"]
+                main_y1 = spans_on_line[0]["y1"]
+
+            parts = []
+            for sp in spans_on_line:
+                text = sp["text"]
+                if not text.strip():
+                    parts.append(text)
+                    continue
+                is_smaller = sp["size"] < body_size - 1.0
+                # Subscript: smaller font, baseline below main
+                if is_smaller and sp["y1"] > main_y1 + 0.5:
+                    if all(c in "0123456789+-=()n" for c in text.strip()):
+                        parts.append(text.translate(SUBS))
+                    else:
+                        unsafe_sub_super = True
+                        parts.append(text)
+                # Superscript: smaller font, baseline above main
+                elif is_smaller and sp["y0"] < main_y0 - 0.5:
+                    if all(c in "0123456789+-=()n" for c in text.strip()):
+                        parts.append(text.translate(SUPS))
+                    else:
+                        unsafe_sub_super = True
+                        parts.append(text)
+                else:
+                    parts.append(text)
+
+            rendered = "".join(parts)
+            # Normalise weird whitespace
+            rendered = re.sub(r"[\u2009\u00a0]", " ", rendered).strip()
+            if rendered:
+                rendered_lines.append((key, spans_on_line[0]["x0"], rendered))
+
+        # ── Detect option markers (A. / B. / C. / D.) ────────────────────────
+        opt_re = re.compile(r"^\s*([ABCD])\.\s*(.*)$")
+        opt_markers: dict = {}
+        for y, x0, text in rendered_lines:
+            m = opt_re.match(text)
+            if m and m.group(1) not in opt_markers:
+                opt_markers[m.group(1)] = (y, m.group(2).strip())
+
+        # ── Build stem ───────────────────────────────────────────────────────
+        stem_lines: list[str] = []
+        first_opt_y = (min(y for y, _ in opt_markers.values())
+                       if opt_markers else float("inf"))
+        qn_strip_re = re.compile(rf"^\s*{q_num}\.\s+(.*)$")
+        qn_alone_re = re.compile(rf"^\s*{q_num}\.\s*$")
+        for y, x0, text in rendered_lines:
+            if y >= first_opt_y:
+                break
+            if not stem_lines:
+                m_strip = qn_strip_re.match(text)
+                if m_strip:
+                    rest = m_strip.group(1).strip()
+                    if rest:
+                        stem_lines.append(rest)
+                    continue
+                if qn_alone_re.match(text):
+                    continue
+            stem_lines.append(text)
+        stem = "\n".join(stem_lines).strip()
+
+        # ── Build option texts ───────────────────────────────────────────────
+        options = {"A": "", "B": "", "C": "", "D": ""}
+        sorted_opts = sorted(opt_markers.items(), key=lambda kv: kv[1][0])
+        for i, (letter, (start_y, init)) in enumerate(sorted_opts):
+            end_y = (sorted_opts[i + 1][1][0]
+                     if i + 1 < len(sorted_opts) else float("inf"))
+            parts = [init] if init else []
+            for y, x0, text in rendered_lines:
+                if y > start_y and y < end_y and not opt_re.match(text):
+                    parts.append(text)
+            options[letter] = " ".join(parts).strip()
+
+        # ── Detect visual content (drawings / images inside bbox) ────────────
+        needs_image = False
+        n_drawings_in_bbox = 0
+        big_draw_area = 0.0
+
+        try:
+            drawings = page.get_drawings()
+            for d in drawings:
+                r = d.get("rect")
+                if r is None:
+                    continue
+                if r.y1 < top_y or r.y0 > bottom_y:
+                    continue
+                n_drawings_in_bbox += 1
+                w, h = r.width, r.height
+                if w >= 4 and h >= 4:
+                    big_draw_area += w * h
+        except Exception:
+            pass
+
+        if big_draw_area > 1500:
+            needs_image = True
+        if not needs_image and n_drawings_in_bbox >= 15:
+            needs_image = True
+
+        if not needs_image:
+            try:
+                for img in page.get_image_info(xrefs=True):
+                    bb = img.get("bbox")
+                    if not bb:
+                        continue
+                    if bb[3] < top_y or bb[1] > bottom_y:
+                        continue
+                    if (bb[2] - bb[0]) * (bb[3] - bb[1]) > 200:
+                        needs_image = True
+                        break
+            except Exception:
+                pass
+
+        # ── Force image when text accuracy is at risk ────────────────────────
+        # Any sub/superscript content that we couldn't translate safely:
+        if unsafe_sub_super:
+            needs_image = True
+
+        def _has_chem_complexity(s: str) -> bool:
+            """True if the text contains any chemistry/math notation that
+            risks distortion in plain text. Strict: when in doubt → image.
+            """
+            if not s:
+                return False
+
+            # ANY Unicode subscript or superscript present
+            if re.search(r"[₀-₉₊₋₌₍₎ₙ⁰-⁹⁺⁻⁼⁽⁾ⁿ]", s):
+                return True
+
+            # Any element-and-digit chemistry formula in the option text:
+            # "C₂₀H₃₀O" extracted as "CHO 2030" or "C 20H30O" or "C20H30O"
+            # Heuristic: 2+ uppercase letters in a row (=multiple elements)
+            # followed by anything — that's a formula and may be corrupted.
+            if re.search(r"[A-Z]{2,}", s):
+                # If it's an all-caps acronym in plain English ("WHO", "DNA"),
+                # length is bounded and there's no digit nearby. Block when
+                # there's a digit anywhere in the string.
+                if re.search(r"\d", s):
+                    return True
+
+            # Letter directly followed by a digit:
+            # C2, NH4, BF3, 10⁻⁹
+            if re.search(r"[A-Z][a-z]?\d", s):
+                return True
+
+            # Letter + space + digit (corrupted formula ordering):
+            # "C 20", "NH 4", "BF 3"
+            if re.search(r"\b[A-Z][a-z]?\s+\d", s):
+                return True
+
+            # Multi-element formula stretches without separators:
+            # "CHCHCHCHCHCHOHCHCOCH"
+            if re.search(r"[A-Z][A-Z][A-Z]{4,}", s):
+                return True
+
+            # Arithmetic operators in mathematical context
+            if re.search(r"[=×]", s):
+                return True
+
+            # Trailing minus signs glued at end (corrupted superscripts)
+            if re.search(r"\s[-+]+\s*$", s):
+                return True
+
+            # Bare double-element word missing subscripts ("BF", "PO" alone)
+            if re.fullmatch(r"\s*[A-Z][a-z]?[A-Z][a-z]?\s*", s):
+                return True
+
+            return False
+
+        if not needs_image:
+            if _has_chem_complexity(stem):
+                needs_image = True
+            else:
+                for L in "ABCD":
+                    if _has_chem_complexity(options[L]):
+                        needs_image = True
+                        break
+
+        # Final fallback: incomplete extraction
+        non_empty_opts = [v for v in options.values()
+                          if v and len(v.strip()) >= 1]
+        if len(non_empty_opts) < 4 or not stem:
+            needs_image = True
+
+        if needs_image:
+            stem = ""
+            options = {"A": "", "B": "", "C": "", "D": ""}
+
+        results.append({
+            "qn":          q_num,
+            "found":       True,
+            "needs_image": needs_image,
+            "text":        stem,
+            "A": options["A"], "B": options["B"],
+            "C": options["C"], "D": options["D"],
+        })
+
+    doc.close()
+    return results
+
+
+def extract_answers(client: anthropic.Anthropic, ms_b64: str,
+                    q_nums: list[int]) -> dict:
+    nums = ", ".join(str(n) for n in q_nums)
+    response = client.messages.create(
         model="claude-opus-4-5",
         max_tokens=2000,
         messages=[{
             "role": "user",
             "content": [
-                {
-                    "type": "document",
-                    "source": {"type": "base64", "media_type": "application/pdf", "data": ms_b64},
-                },
-                {
-                    "type": "text",
-                    "text": f"""Extract the correct answers for question numbers {nums_str}
-from this IB mark scheme.
+                {"type": "document",
+                 "source": {"type": "base64", "media_type": "application/pdf",
+                            "data": ms_b64}},
+                {"type": "text", "text": f"""Extract the correct answers for question numbers {nums} from this mark scheme.
 
-The mark scheme shows a grid like:
-1. D    16. C    31. C
-2. A    17. D    32. B
+The mark scheme typically lists the answers like:
+  1. D    16. C    31. C
+  2. A    17. D    32. B
 
-Return ONLY this JSON — no markdown, no explanation:
+Return ONLY this JSON object — no markdown, no explanation:
 {{"1":"D","2":"A","3":"B",...}}
 
-Use "NOT_FOUND" for any question not in the mark scheme.""",
-                },
-            ],
-        }],
+Use "NOT_FOUND" for any question not in the mark scheme."""}
+            ]
+        }]
     )
-    raw = "".join(b.text for b in resp.content if hasattr(b, "text"))
+    raw = "".join(b.text for b in response.content if hasattr(b, "text"))
     data = safe_json(raw)
     return data if isinstance(data, dict) else {}
 
 
-# ─── PDF page → PNG bytes (cached per session) ───────────────────────────────
-_page_cache: dict = {}
-
-def render_page_png(pdf_bytes: bytes, page_num: int, dpi: int = 180) -> bytes:
-    """Render a 1-indexed PDF page to PNG bytes (cached within a run)."""
-    key = (id(pdf_bytes), page_num)
-    if key not in _page_cache:
-        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-        idx = page_num - 1
-        if idx < 0 or idx >= len(doc):
-            doc.close()
-            return b""
-        mat = fitz.Matrix(dpi / 72, dpi / 72)
-        pix = doc[idx].get_pixmap(matrix=mat, alpha=False)
-        _page_cache[key] = pix.tobytes("png")
-        doc.close()
-    return _page_cache[key]
-
-
-def crop_question_png(
-    client: anthropic.Anthropic,
-    pdf_bytes: bytes,
-    page_num: int,
-    q_num: int,
-) -> bytes:
-    """Return PNG bytes of the question area cropped from the QP page.
-    Uses Claude to locate the bounding box; falls back to full page.
-    Never returns a text description — always an image.
-    """
-    page_png = render_page_png(pdf_bytes, page_num)
-    if not page_png:
-        return b""
-
-    img = Image.open(io.BytesIO(page_png))
-    w, h = img.size
-
-    try:
-        resp = client.messages.create(
-            model="claude-opus-4-5",
-            max_tokens=300,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": to_b64(page_png),
-                        },
-                    },
-                    {
-                        "type": "text",
-                        "text": (
-                            f"This is page {page_num} of an IB exam paper "
-                            f"({w}x{h} px).\n"
-                            f"Find question number {q_num} and return its "
-                            "bounding box in pixels, including ALL its content "
-                            "(stem, options, table, diagram, graph).\n"
-                            "Return ONLY JSON — no markdown:\n"
-                            '{"top":<int>,"left":<int>,"bottom":<int>,"right":<int>}'
-                        ),
-                    },
-                ],
-            }],
-        )
-        raw    = "".join(b.text for b in resp.content if hasattr(b, "text"))
-        coords = safe_json(raw)
-
-        if isinstance(coords, dict) and all(
-            k in coords for k in ("top", "left", "bottom", "right")
-        ):
-            pad    = 20
-            left   = max(0, int(coords["left"])   - pad)
-            top    = max(0, int(coords["top"])    - pad)
-            right  = min(w, int(coords["right"])  + pad)
-            bottom = min(h, int(coords["bottom"]) + pad)
-            if right > left and bottom > top:
-                cropped = img.crop((left, top, right, bottom))
-                buf = io.BytesIO()
-                cropped.save(buf, format="PNG")
-                return buf.getvalue()
-    except Exception:
-        pass
-
-    # Fallback: return the full rendered page
-    return page_png
-
-
-# ─── LaTeX → Unicode ──────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────────
+#  LaTeX → Unicode (for inline equations in text-only questions)
+# ───────────────────────────────────────────────────────────────────────────────
 _SUPS = {"0":"⁰","1":"¹","2":"²","3":"³","4":"⁴","5":"⁵","6":"⁶","7":"⁷",
          "8":"⁸","9":"⁹","+":"⁺","-":"⁻","n":"ⁿ","m":"ᵐ","x":"ˣ","a":"ᵃ","b":"ᵇ"}
 _SUBS = {"0":"₀","1":"₁","2":"₂","3":"₃","4":"₄","5":"₅","6":"₆","7":"₇",
@@ -334,12 +632,11 @@ def _math(m: str) -> str:
     t = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"(\1)/(\2)", m)
     for k, v in {
         r"\times":"×", r"\rightarrow":"→", r"\rightleftharpoons":"⇌",
-        r"\leftrightarrow":"↔", r"\to":"→", r"\Delta":"Δ", r"\delta":"δ",
-        r"\ominus":"⊖", r"\oplus":"⊕", r"\theta":"θ", r"\alpha":"α",
-        r"\beta":"β",  r"\gamma":"γ",  r"\lambda":"λ", r"\mu":"μ",
-        r"\pi":"π",    r"\sigma":"σ",  r"\cdot":"·",   r"\pm":"±",
-        r"\geq":"≥",   r"\leq":"≤",    r"\neq":"≠",    r"\approx":"≈",
-        r"\infty":"∞", r"\circ":"°",
+        r"\to":"→", r"\Delta":"Δ", r"\delta":"δ", r"\ominus":"⊖",
+        r"\alpha":"α", r"\beta":"β", r"\gamma":"γ", r"\lambda":"λ",
+        r"\mu":"μ", r"\pi":"π", r"\sigma":"σ", r"\cdot":"·", r"\pm":"±",
+        r"\geq":"≥", r"\leq":"≤", r"\neq":"≠", r"\approx":"≈",
+        r"\circ":"°",
     }.items():
         t = t.replace(k, v)
     t = re.sub(r"\^\{([^{}]{1,12})\}", lambda m: _to_sup(m.group(1)), t)
@@ -355,28 +652,39 @@ def latex_to_text(text: str) -> str:
     t = str(text)
     t = re.sub(r"\$\$([^$]+)\$\$", lambda m: _math(m.group(1)), t)
     t = re.sub(r"\$([^$\n]+)\$",   lambda m: _math(m.group(1)), t)
-    t = re.sub(r"\\\[([^\]]+)\\\]",lambda m: _math(m.group(1)), t)
+    t = re.sub(r"\\\[([^\]]+)\\\]", lambda m: _math(m.group(1)), t)
     t = re.sub(r"\*\*([^*]+)\*\*", r"\1", t)
     t = re.sub(r"\*([^*]+)\*",     r"\1", t)
     return t
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 #  WORD DOCUMENT BUILDER
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════════════════════════
 DIFF_ORDER = ["Easy", "Medium", "Hard"]
 
+# A4 page with 2 cm margins → content width ≈ 17 cm
+CONTENT_WIDTH_CM = 17.0
 
-def _set_cell_borders(cell):
-    tc   = cell._tc
-    tcPr = tc.get_or_add_tcPr()
-    for side in ("top", "left", "bottom", "right"):
-        el = OxmlElement(f"w:{side}")
-        el.set(docx_qn("w:val"),   "single")
-        el.set(docx_qn("w:sz"),    "4")
-        el.set(docx_qn("w:color"), "999999")
-        tcPr.append(el)
+
+def _set_cell_borders(cell, top="single", left="single", right="single",
+                      bottom="single", color="999999",
+                      bot_color=None, top_color=None,
+                      sz_top=8, sz_bot=8):
+    tcPr = cell._tc.get_or_add_tcPr()
+    tcBorders = OxmlElement("w:tcBorders")
+    for side, style, sz, c in [
+        ("top",    top,    sz_top, top_color or color),
+        ("left",   left,   8,      color),
+        ("bottom", bottom, sz_bot, bot_color or color),
+        ("right",  right,  8,      color),
+    ]:
+        b = OxmlElement(f"w:{side}")
+        b.set(docx_qn("w:val"),   style)
+        b.set(docx_qn("w:sz"),    str(sz))
+        b.set(docx_qn("w:color"), c)
+        tcBorders.append(b)
+    tcPr.append(tcBorders)
 
 
 def _run(para, text, *, bold=False, italic=False, color=None, size_pt=11):
@@ -390,187 +698,349 @@ def _run(para, text, *, bold=False, italic=False, color=None, size_pt=11):
     return r
 
 
-def _hr(doc):
-    p   = doc.add_paragraph()
+def _insert_pBdr(p, pBdr):
+    """OOXML schema requires pBdr to come BEFORE spacing/ind/jc/rPr in pPr."""
     pPr = p._p.get_or_add_pPr()
+    insert_idx = len(pPr)
+    for i, child in enumerate(pPr):
+        tag = child.tag.split('}')[-1]
+        if tag in ('spacing', 'ind', 'jc', 'contextualSpacing',
+                   'mirrorIndents', 'rPr', 'sectPr'):
+            insert_idx = i
+            break
+    pPr.insert(insert_idx, pBdr)
+
+
+def _hr(doc, color="CCCCCC"):
+    p    = doc.add_paragraph()
     pBdr = OxmlElement("w:pBdr")
     bot  = OxmlElement("w:bottom")
     bot.set(docx_qn("w:val"),   "single")
-    bot.set(docx_qn("w:sz"),    "4")
-    bot.set(docx_qn("w:color"), "CCCCCC")
+    bot.set(docx_qn("w:sz"),    "6")
+    bot.set(docx_qn("w:color"), color)
     pBdr.append(bot)
-    pPr.append(pBdr)
+    _insert_pBdr(p, pBdr)
+    return p
+
+
+def _add_solution_box(doc, n_lines: int = 4):
+    """Reference format: 4-row table, each row ~0.9 cm tall,
+       only a thin bottom border (#BFBFBF) — produces 4 writing lines.
+    """
+    table = doc.add_table(rows=n_lines, cols=1)
+    table.autofit = False
+    for cell in table.columns[0].cells:
+        cell.width = Cm(CONTENT_WIDTH_CM)
+
+    for row in table.rows:
+        # Row height = 510 twips (matches reference)
+        trPr = row._tr.get_or_add_trPr()
+        trH  = OxmlElement("w:trHeight")
+        trH.set(docx_qn("w:val"), "510")
+        trPr.append(trH)
+
+        cell = row.cells[0]
+        tcPr = cell._tc.get_or_add_tcPr()
+        tcBorders = OxmlElement("w:tcBorders")
+        for side, val, sz, color in [
+            ("top",    "nil",    "0", "auto"),
+            ("left",   "nil",    "0", "auto"),
+            ("right",  "nil",    "0", "auto"),
+            ("bottom", "single", "4", "BFBFBF"),
+        ]:
+            b = OxmlElement(f"w:{side}")
+            b.set(docx_qn("w:val"), val)
+            if val != "nil":
+                b.set(docx_qn("w:sz"),    sz)
+                b.set(docx_qn("w:color"), color)
+            tcBorders.append(b)
+        tcPr.append(tcBorders)
+
+        p = cell.paragraphs[0]
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after  = Pt(0)
 
 
 def build_word_document(
-    questions:   list[dict],
-    qp_bytes:    bytes,
-    client:      anthropic.Anthropic,
+    questions:  list[dict],
+    qp_bytes:   bytes,
+    locations:  dict,
     progress_cb=None,
 ) -> bytes:
+    """Build the Word worksheet.
+       - Visual questions → cropped image only (no text duplication)
+       - Text-only questions → text + options
     """
-    Build the Word worksheet.
-    Visual questions → crop actual image from QP PDF page, embed in Word.
-    No 'Visual content: …' text is ever written.
-    """
-    _page_cache.clear()
-
     doc = Document()
+
+    # Page setup: A4, 2 cm margins
     for section in doc.sections:
         section.top_margin    = Cm(2.0)
         section.bottom_margin = Cm(2.0)
-        section.left_margin   = Cm(2.5)
-        section.right_margin  = Cm(2.5)
+        section.left_margin   = Cm(2.0)
+        section.right_margin  = Cm(2.0)
 
-    # Title
-    tp = doc.add_paragraph()
-    tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _run(tp, "IB Chemistry – Higher Level", bold=True, color="1F4E79", size_pt=18)
-    sp = doc.add_paragraph()
-    sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _run(sp, "Exam Worksheet", color="555555", size_pt=12)
-    doc.add_paragraph()
-
-    # Group by topic → difficulty
+    # ── Group by Topic → Difficulty ───────────────────────────────────────────
     grouped: dict[str, dict[str, list]] = {}
     for q in questions:
         t = q.get("topic") or "Unclassified"
         d = q.get("difficulty") or "Unspecified"
         grouped.setdefault(t, {}).setdefault(d, []).append(q)
 
-    visual_qs    = [q for q in questions if q.get("hasVisual")]
-    total_visual = len(visual_qs)
-    visual_done  = 0
+    # Sort chapters by their leading number (1., 2., …, 10.). Topics without
+    # a leading number (e.g. "Unclassified") go last in alphabetical order.
+    def _chapter_sort_key(topic: str):
+        m = re.match(r"^\s*(\d+)\s*[\.\-:]", str(topic))
+        if m:
+            return (0, int(m.group(1)), str(topic))
+        return (1, 0, str(topic).lower())
 
-    for topic, diffs in grouped.items():
-        h2 = doc.add_heading(topic, level=2)
-        if h2.runs:
-            h2.runs[0].font.color.rgb = RGBColor(0x1F, 0x4E, 0x79)
+    sorted_topics = sorted(grouped.keys(), key=_chapter_sort_key)
+
+    visual_qs   = [q for q in questions if q.get("needs_image")]
+    total_imgs  = len(visual_qs)
+    img_done    = 0
+
+    is_first_chapter = True
+    for topic in sorted_topics:
+        diffs = grouped[topic]
+        # ── Chapter heading: bold 20pt black, plain (no border, no color) ──
+        h = doc.add_paragraph()
+        # Page break before each new chapter (except the very first one)
+        if not is_first_chapter:
+            h.paragraph_format.page_break_before = True
+        h.paragraph_format.space_before = Pt(0)
+        h.paragraph_format.space_after  = Pt(8)
+        _run(h, topic, bold=True, size_pt=20)
 
         sorted_diffs = sorted(
             diffs.keys(),
-            key=lambda d: DIFF_ORDER.index(d) if d in DIFF_ORDER else 99,
+            key=lambda d: DIFF_ORDER.index(d) if d in DIFF_ORDER else 99
         )
 
+        # Per-chapter display counter — restarts at 1 for every new chapter.
+        # The original q["qn"] from Excel is still used internally for
+        # cropping the QP image and matching the answer.
+        display_counter = 0
+
+        is_first_diff_in_chapter = True
         for diff in sorted_diffs:
+            # Difficulty heading: bold + italic, 13pt
             dp = doc.add_paragraph()
-            _run(dp, f"— {diff} questions —", italic=True, color="666666", size_pt=11)
+            # Page break before a new difficulty within same chapter
+            # (skip if it's the first difficulty — chapter heading already
+            # triggered the page break)
+            if not is_first_diff_in_chapter:
+                dp.paragraph_format.page_break_before = True
+            dp.paragraph_format.space_before = Pt(8)
+            dp.paragraph_format.space_after  = Pt(6)
+            _run(dp, f"— {diff} questions —",
+                 bold=True, italic=True, size_pt=13)
 
+            is_first_q_in_diff = True
             for q in diffs[diff]:
-                q_num    = q["qn"]
-                page_num = q.get("page_num", 0)
-                stem     = latex_to_text(q.get("text", ""))
-                opt_a    = latex_to_text(q.get("A", ""))
-                opt_b    = latex_to_text(q.get("B", ""))
-                opt_c    = latex_to_text(q.get("C", ""))
-                opt_d    = latex_to_text(q.get("D", ""))
-                answer   = q.get("answer",      "Answer not found in uploaded Mark Scheme")
-                ans_ok   = q.get("answerFound", False)
-                has_vis  = q.get("hasVisual",   False)
-                quote    = q.get("quote",       "")
-                topic_   = q.get("topic",       "")
-                diff_    = q.get("difficulty",  "")
-                marks    = q.get("marks",       1)
-                ref      = q.get("ref",         "")
+                q_num   = q["qn"]                     # internal — for QP/MS lookup
+                display_counter += 1
+                display_num = display_counter         # shown to the student
+                found   = q.get("found", True)
+                vis     = q.get("needs_image", False) and found
+                answer  = q.get("answer", "Answer not found in uploaded Mark Scheme")
+                ans_ok  = q.get("answerFound", False)
+                text    = latex_to_text(q.get("text", ""))
+                opts    = {L: latex_to_text(q.get(L, "")) for L in "ABCD"}
+                topic_  = q.get("topic", "Unclassified")
+                diff_   = q.get("difficulty", "")
+                marks   = q.get("marks", 1)
+                ref     = q.get("ref", "")
+                quote   = q.get("quote", "")
 
-                # ── Question header ────────────────────────────────────────
+                # ── Question header: bold 13pt ─────────────────────────────────
                 qh = doc.add_paragraph()
-                _run(qh, f"Question: {q_num}", bold=True, color="1F4E79", size_pt=13)
+                # Every question starts on a new page, except the very first
+                # question in its difficulty group (the difficulty heading
+                # paragraph already triggered the page break above).
+                if not is_first_q_in_diff:
+                    qh.paragraph_format.page_break_before = True
+                qh.paragraph_format.space_before = Pt(0)
+                qh.paragraph_format.space_after  = Pt(2)
+                _run(qh, f"Question: {display_num}", bold=True, size_pt=13)
 
-                # ── Meta line ──────────────────────────────────────────────
-                meta_p = doc.add_paragraph()
-                _run(meta_p, "Level: ",     bold=True, size_pt=10)
-                _run(meta_p, f"{diff_}   ",        size_pt=10, color="333333")
-                _run(meta_p, "Marks: ",     bold=True, size_pt=10)
-                _run(meta_p, f"{marks}   ",        size_pt=10, color="333333")
-                _run(meta_p, "Ref: ",       bold=True, size_pt=10)
-                _run(meta_p, ref,                  size_pt=10, color="333333")
+                # ── Meta line ─────────────────────────────────────────────────
+                # **Level of question**: Easy  |  **Number of Marks: **1  |
+                # **Reference:** (xxx)  |
+                mp = doc.add_paragraph()
+                mp.paragraph_format.space_before = Pt(0)
+                mp.paragraph_format.space_after  = Pt(2)
+                _run(mp, "Level of question",  bold=True, size_pt=11)
+                _run(mp, f": {diff_}  |  ",                size_pt=11)
+                _run(mp, "Number of Marks: ",  bold=True, size_pt=11)
+                _run(mp, f"{marks}  |  ",                  size_pt=11)
+                _run(mp, "Reference:",         bold=True, size_pt=11)
+                _run(mp, f" {ref}  |",                     size_pt=11)
 
-                ch_p = doc.add_paragraph()
-                _run(ch_p, "Chapter: ", bold=True, size_pt=10)
-                _run(ch_p, topic_,             size_pt=10, color="333333")
+                # ── Chapter line ──────────────────────────────────────────────
+                # **Chapter** :  [name]
+                cp = doc.add_paragraph()
+                cp.paragraph_format.space_before = Pt(0)
+                cp.paragraph_format.space_after  = Pt(2)
+                _run(cp, "Chapter", bold=True, size_pt=11)
+                _run(cp, f" :  {topic_}",     size_pt=11)
 
-                # ── Visual: crop real image from QP, embed in Word ─────────
-                if has_vis:
-                    visual_done += 1
+                # ── Separator after meta info ─────────────────────────────────
+                hr_after_meta = _hr(doc, color="BFBFBF")
+
+                # ── Detect failed text extraction ──────────────────────────────
+                def _looks_failed(stem: str, options: dict) -> bool:
+                    """True if the extracted text is empty, placeholder, or
+                    test data — i.e. anything that would look unprofessional
+                    in the final Word file. When True, the build switches to
+                    a cropped image from QP PDF instead.
+                    """
+                    s = (stem or "").strip()
+                    if not s:
+                        return True
+                    sl = s.lower()
+                    # Bracketed placeholders: [Q2 stem], [Q12], [stem]
+                    if re.search(r"\[\s*q\s*\d+", sl):
+                        return True
+                    if re.search(r"\[\s*stem\s*\]", sl):
+                        return True
+                    # "Test stem for Q12", "test stem", "stem"
+                    if re.search(r"\btest\s+stem\b", sl):
+                        return True
+                    if sl in ("stem", "[stem]", "n/a", "tbd",
+                              "placeholder", "todo", "todo:"):
+                        return True
+                    # "Q12 stem", "Q5 stem"
+                    if re.match(r"^q\s*\d+\s*stem\s*$", sl):
+                        return True
+                    # Generic placeholder words
+                    if "placeholder" in sl:
+                        return True
+
+                    # Options validation
+                    non_empty = [v for v in options.values() if v and v.strip()]
+                    if not non_empty:
+                        return True
+                    # Single letters: A=A, B=B…
+                    if all(v.strip().upper() in ("A", "B", "C", "D")
+                           for v in non_empty):
+                        return True
+                    # "option A", "option B", "Option C"…
+                    if all(re.match(r"^option\s*[a-d]$", v.strip(), re.I)
+                           for v in non_empty):
+                        return True
+                    # Generic placeholder words in options
+                    if any("placeholder" in v.lower() or
+                           re.search(r"\[\s*[a-d]\s*\]", v.lower())
+                           for v in non_empty):
+                        return True
+                    return False
+
+                # If marked text-only but extraction is bad AND we can crop the
+                # question from QP → switch to image fallback.
+                if (found and not vis
+                        and _looks_failed(text, opts)
+                        and q_num in locations):
+                    vis = True
+
+                # ── Body: image OR text ────────────────────────────────────────
+                if not found:
+                    np_ = doc.add_paragraph()
+                    _run(np_, "Question not found in uploaded Question Paper",
+                         italic=True, size_pt=11)
+
+                elif vis:
                     if progress_cb:
-                        progress_cb(
-                            visual_done, total_visual,
-                            f"Cropping image for Q{q_num} (page {page_num})…",
-                        )
-                    img_bytes = b""
-                    if qp_bytes and page_num > 0:
-                        img_bytes = crop_question_png(client, qp_bytes, page_num, q_num)
+                        progress_cb(img_done + 1, total_imgs or 1,
+                                    f"Cropping Q{q_num} from QP…")
+                    img_done += 1
+                    img_bytes = crop_question_png(qp_bytes, locations, q_num)
                     if img_bytes:
-                        try:
-                            doc.add_picture(io.BytesIO(img_bytes), width=Cm(14))
-                        except Exception:
-                            _run(
-                                doc.add_paragraph(),
-                                "[Image could not be embedded — see QP PDF]",
-                                italic=True, color="888888", size_pt=10,
-                            )
+                        ip = doc.add_paragraph()
+                        ip.paragraph_format.space_before = Pt(0)
+                        ip.paragraph_format.space_after  = Pt(4)
+                        ip.add_run().add_picture(io.BytesIO(img_bytes),
+                                                 width=Cm(CONTENT_WIDTH_CM - 1.0))
+                    elif text and not _looks_failed(text, opts):
+                        # Crop failed but we have valid text — use it
+                        for line in text.split("\n"):
+                            if line.strip():
+                                _run(doc.add_paragraph(), line, size_pt=11)
+                        for L in "ABCD":
+                            if opts[L]:
+                                op = doc.add_paragraph()
+                                op.paragraph_format.space_before = Pt(2)
+                                op.paragraph_format.space_after  = Pt(2)
+                                _run(op, f"{L}.  {opts[L]}", size_pt=11)
                     else:
-                        _run(
-                            doc.add_paragraph(),
-                            "[Image not available — see QP PDF]",
-                            italic=True, color="888888", size_pt=10,
-                        )
+                        # Both crop and text failed
+                        np_ = doc.add_paragraph()
+                        _run(np_,
+                             f"Question Q{q_num} could not be extracted from QP — "
+                             "please refer to the original Question Paper.",
+                             italic=True, size_pt=11)
 
-                # ── Question stem text ─────────────────────────────────────
-                for line in stem.split("\n"):
-                    lp = doc.add_paragraph()
-                    _run(lp, line, size_pt=11)
+                else:
+                    # Text-only question (extraction looks valid)
+                    for line in text.split("\n"):
+                        if line.strip():
+                            tp = doc.add_paragraph()
+                            tp.paragraph_format.space_before = Pt(0)
+                            tp.paragraph_format.space_after  = Pt(2)
+                            _run(tp, line, size_pt=11)
+                    for L in "ABCD":
+                        if opts[L]:
+                            op = doc.add_paragraph()
+                            op.paragraph_format.space_before = Pt(2)
+                            op.paragraph_format.space_after  = Pt(2)
+                            _run(op, f"{L}.  {opts[L]}", size_pt=11)
 
-                # ── Options ────────────────────────────────────────────────
-                for letter, opt_text in [
-                    ("A", opt_a), ("B", opt_b), ("C", opt_c), ("D", opt_d)
-                ]:
-                    if opt_text:
-                        op = doc.add_paragraph()
-                        op.paragraph_format.left_indent = Cm(1.0)
-                        _run(op, f"{letter}.  ", bold=True, size_pt=11)
-                        _run(op, opt_text,              size_pt=11)
-
-                # ── Student solution box ───────────────────────────────────
+                # ── Student's Solution (bold 11pt) ─────────────────────────────
                 sl = doc.add_paragraph()
+                sl.paragraph_format.space_before = Pt(8)
+                sl.paragraph_format.space_after  = Pt(2)
                 _run(sl, "Student's Solution:", bold=True, size_pt=11)
 
-                tbl  = doc.add_table(rows=1, cols=1)
-                tbl.style = "Table Grid"
-                cell = tbl.cell(0, 0)
-                _set_cell_borders(cell)
-                ip   = cell.paragraphs[0]
-                ip.paragraph_format.space_before = Pt(18)
-                ip.paragraph_format.space_after  = Pt(18)
-                ip.add_run(" ")
-                doc.add_paragraph()
+                # 4 writing lines (matches reference exactly)
+                _add_solution_box(doc, n_lines=4)
 
-                # ── Answer from MS ─────────────────────────────────────────
+                # ── Answer from Mark Scheme ────────────────────────────────────
                 ap = doc.add_paragraph()
+                ap.paragraph_format.space_before = Pt(8)
+                ap.paragraph_format.space_after  = Pt(2)
                 _run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
+
                 av = doc.add_paragraph()
-                _run(av, answer, bold=True,
-                     color="C00000" if ans_ok else "888888", size_pt=14)
+                av.paragraph_format.space_before = Pt(0)
+                av.paragraph_format.space_after  = Pt(2)
+                _run(av, answer, bold=True, size_pt=12)
 
-                # ── Motivational quote ─────────────────────────────────────
+                # ── Separator before Keep it up ────────────────────────────────
+                _hr(doc, color="BFBFBF")
+
+                # ── Keep it up: ────────────────────────────────────────────────
                 if quote:
-                    qp_ = doc.add_paragraph()
-                    _run(qp_, "Keep it up:  ", bold=True, italic=True,
-                         color="555555", size_pt=10)
-                    _run(qp_, quote, italic=True, color="555555", size_pt=10)
+                    qup = doc.add_paragraph()
+                    qup.paragraph_format.space_before = Pt(2)
+                    qup.paragraph_format.space_after  = Pt(2)
+                    _run(qup, "Keep it up", bold=True, size_pt=11)
+                    _run(qup, f" : {quote}",       size_pt=11)
 
-                _hr(doc)
+                is_first_q_in_diff = False
+
+            is_first_diff_in_chapter = False
+
+        is_first_chapter = False
 
     buf = io.BytesIO()
     doc.save(buf)
     return buf.getvalue()
 
 
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN STREAMLIT FLOW
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ═══════════════════════════════════════════════════════════════════════════════
 if st.button(
     "⚡ Extract & Generate Worksheet",
     type="primary",
@@ -578,100 +1048,117 @@ if st.button(
 ):
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
-    # Read QP bytes once — needed for both Claude extraction and image cropping
     qp_bytes = read_bytes(qp_file)
     ms_bytes = read_bytes(ms_file)
 
     with st.status("Processing…", expanded=True) as status:
 
-        # 1. Excel → metadata only (never question text or answer)
+        # 1 — Excel
         st.write("📊 Reading Excel (metadata only)…")
         try:
             xl_rows = parse_excel(xl_file)
         except Exception as e:
             st.error(f"Failed to read Excel: {e}")
             st.stop()
+        if not xl_rows:
+            st.error("No valid question rows found in Excel.")
+            st.stop()
 
         q_nums = [r["qn"] for r in xl_rows]
         meta   = {r["qn"]: r for r in xl_rows}
-        st.write(
-            f"✅ {len(q_nums)} questions: "
-            f"Q{', Q'.join(str(n) for n in q_nums[:6])}"
-            f"{'…' if len(q_nums) > 6 else ''}"
-        )
+        st.write(f"✅ {len(q_nums)} questions in Excel "
+                 f"(Q{', Q'.join(str(n) for n in q_nums[:6])}{'…' if len(q_nums) > 6 else ''})")
 
-        # 2. Extract questions verbatim from QP PDF
-        st.write(f"🔍 Extracting {len(q_nums)} questions from QP PDF (verbatim)…")
+        # 2 — PyMuPDF coordinate detection
+        st.write("📍 Locating questions in QP PDF…")
         try:
-            qp_data = extract_questions_from_qp(client, to_b64(qp_bytes), q_nums)
+            locations = find_question_locations(qp_bytes)
+        except Exception as e:
+            st.error(f"Failed to scan QP PDF: {e}")
+            st.stop()
+        located_n = sum(1 for n in q_nums if n in locations)
+        st.write(f"✅ Located {located_n}/{len(q_nums)} questions in QP")
+        missing_loc = [n for n in q_nums if n not in locations]
+        if missing_loc:
+            st.warning(f"⚠ Could not locate in QP: Q{', Q'.join(str(n) for n in missing_loc)}")
+
+        # 3 — Extract text + classify (visual vs text-only) using PyMuPDF
+        st.write("🔍 Extracting question text from QP (deterministic, no LLM)…")
+        try:
+            qp_data = classify_and_extract(
+                client, to_b64(qp_bytes), q_nums,
+                qp_bytes=qp_bytes, locations=locations,
+            )
         except Exception as e:
             st.error(f"QP extraction failed: {e}")
             st.stop()
+        found_n   = sum(1 for q in qp_data if q.get("found") is not False)
+        visual_n  = sum(1 for q in qp_data if q.get("needs_image"))
+        st.write(f"✅ {found_n}/{len(q_nums)} found · {visual_n} need cropped images")
 
-        found_n = sum(1 for q in qp_data if q.get("found") is not False)
-        st.write(f"✅ {found_n}/{len(q_nums)} questions extracted from QP")
-
-        not_found_list = [
-            n for n in q_nums
-            if not any(
-                int(q.get("qn", -1)) == n and q.get("found") is not False
-                for q in qp_data
-            )
-        ]
-        if not_found_list:
-            st.warning(
-                f"⚠ Not found in QP: Q{', Q'.join(str(n) for n in not_found_list)}"
-            )
-
-        # 3. Extract answers from MS PDF
+        # 4 — Mark Scheme
         st.write("🔑 Extracting answers from Mark Scheme PDF…")
         try:
-            ms_data = extract_answers_from_ms(client, to_b64(ms_bytes), q_nums)
+            ms_data = extract_answers(client, to_b64(ms_bytes), q_nums)
         except Exception as e:
             st.error(f"MS extraction failed: {e}")
             st.stop()
-
         ans_n = sum(1 for v in ms_data.values() if v and v != "NOT_FOUND")
-        st.write(f"✅ {ans_n} answers extracted from Mark Scheme")
+        st.write(f"✅ {ans_n} answers extracted from MS")
 
-        # 4. Merge
-        st.write("🔗 Merging data…")
+        # 5 — Merge
+        st.write("🔗 Merging…")
         questions: list[dict] = []
         for n in q_nums:
-            qp_q        = next((q for q in qp_data if int(q.get("qn", -1)) == n), {})
-            ans         = ms_data.get(str(n), "")
-            not_found_q = qp_q.get("found") is False or not qp_q
-            not_found_a = not ans or ans == "NOT_FOUND"
-            m           = meta[n]
+            qp_q = next((q for q in qp_data if int(q.get("qn", -1)) == n), {})
+            ans  = ms_data.get(str(n), "")
+            found_q = bool(qp_q) and qp_q.get("found") is not False
+            ans_ok  = bool(ans) and ans != "NOT_FOUND"
+
+            # If Claude says needs_image but we couldn't locate the question,
+            # we still show whatever text Claude returned.
+            needs_img = qp_q.get("needs_image", False) and (n in locations)
 
             questions.append({
-                **m,
-                "text":        (
-                    "Question not found in uploaded Question Paper"
-                    if not_found_q else qp_q.get("text", "")
-                ),
-                "A":           qp_q.get("A", "") if not not_found_q else "",
-                "B":           qp_q.get("B", "") if not not_found_q else "",
-                "C":           qp_q.get("C", "") if not not_found_q else "",
-                "D":           qp_q.get("D", "") if not not_found_q else "",
-                "hasVisual":   qp_q.get("hasVisual", False),
-                "found":       not not_found_q,
-                "answer":      (
-                    "Answer not found in uploaded Mark Scheme"
-                    if not_found_a else ans
-                ),
-                "answerFound": not not_found_a,
+                **meta[n],
+                "found":       found_q,
+                "needs_image": needs_img,
+                "text":        qp_q.get("text", "")  if found_q else "",
+                "A":           qp_q.get("A", "")     if found_q else "",
+                "B":           qp_q.get("B", "")     if found_q else "",
+                "C":           qp_q.get("C", "")     if found_q else "",
+                "D":           qp_q.get("D", "")     if found_q else "",
+                "answer":      ans if ans_ok else "Answer not found in uploaded Mark Scheme",
+                "answerFound": ans_ok,
             })
 
         status.update(label="✅ Extraction done!", state="complete")
 
-    # ── Preview ────────────────────────────────────────────────────────────────
-    st.subheader("Preview")
+    # ── Validation summary ────────────────────────────────────────────────────
+    st.subheader("Validation Summary")
+    total       = len(questions)
+    found_qp    = sum(1 for q in questions if q["found"])
+    found_ms    = sum(1 for q in questions if q["answerFound"])
+    visual_cnt  = sum(1 for q in questions if q["needs_image"])
+    crop_failed = sum(
+        1 for q in questions
+        if q["needs_image"] and crop_question_png(qp_bytes, locations, q["qn"]) is None
+    )
+
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total",         len(questions))
-    c2.metric("Found in QP",   sum(1 for q in questions if q["found"]))
-    c3.metric("Answers found", sum(1 for q in questions if q["answerFound"]))
-    c4.metric("Has visuals",   sum(1 for q in questions if q["hasVisual"]))
+    c1.metric("Total",          total)
+    c2.metric("Found in QP",    found_qp,  delta=found_qp - total if found_qp != total else None)
+    c3.metric("Answers found",  found_ms,  delta=found_ms - total if found_ms != total else None)
+    c4.metric("With visuals",   visual_cnt)
+
+    missing_qp = [q["qn"] for q in questions if not q["found"]]
+    missing_ms = [q["qn"] for q in questions if not q["answerFound"]]
+    if missing_qp:
+        st.warning(f"⚠ Missing from QP: Q{', Q'.join(str(n) for n in missing_qp)}")
+    if missing_ms:
+        st.warning(f"⚠ Missing from MS: Q{', Q'.join(str(n) for n in missing_ms)}")
+    if crop_failed:
+        st.warning(f"⚠ {crop_failed} image crops failed (text fallback used)")
 
     st.dataframe(
         [{
@@ -680,30 +1167,27 @@ if st.button(
             "Chapter":    q.get("topic", ""),
             "Difficulty": q.get("difficulty", ""),
             "Marks":      q.get("marks", ""),
-            "Answer":     q.get("answer", ""),
+            "Type":       "🖼 Image" if q["needs_image"] else "📝 Text",
+            "Answer":     q["answer"] if q["answerFound"] else "—",
             "Found?":     "✅" if q["found"] else "❌",
-            "Visual?":    "🖼" if q["hasVisual"] else "",
         } for q in questions],
         use_container_width=True,
         hide_index=True,
     )
 
-    # ── Build Word ─────────────────────────────────────────────────────────────
+    # ── Build & Download ──────────────────────────────────────────────────────
     st.subheader("Download")
-    visual_count = sum(1 for q in questions if q["hasVisual"])
-
-    if visual_count:
+    if visual_cnt:
         st.info(
-            f"ℹ️ {visual_count} questions contain visual content (diagrams/graphs). "
-            "Actual images will be cropped from the QP PDF and embedded in the Word file. "
-            "This may take ~10–20 seconds."
+            f"ℹ️ {visual_cnt} questions contain visual content — actual images "
+            "will be cropped from the QP PDF and embedded in the Word file."
         )
 
     prog_bar  = st.progress(0)
     prog_text = st.empty()
 
-    def on_progress(done, total, msg):
-        prog_bar.progress(done / max(total, 1))
+    def on_progress(done, total_, msg):
+        prog_bar.progress(done / max(total_, 1))
         prog_text.text(msg)
 
     with st.spinner("Building Word document…"):
@@ -711,8 +1195,8 @@ if st.button(
             docx_bytes = build_word_document(
                 questions,
                 qp_bytes,
-                client,
-                progress_cb=on_progress if visual_count else None,
+                locations,
+                progress_cb=on_progress if visual_cnt else None,
             )
         except Exception as e:
             st.error(f"Word generation failed: {e}")
