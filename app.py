@@ -125,6 +125,8 @@ def parse_excel(uploaded_file) -> list[dict]:
             return fallback
 
     rows = []
+    seen_qns = set()
+    duplicates = []
     for row in ws.iter_rows(min_row=2):
         try:
             q_num = int(float(str(list(row)[qn_idx].value)))
@@ -132,6 +134,12 @@ def parse_excel(uploaded_file) -> list[dict]:
             continue
         if q_num <= 0:
             continue
+
+        # ── Deduplication: keep only the FIRST occurrence of each qn ────────
+        if q_num in seen_qns:
+            duplicates.append(q_num)
+            continue
+        seen_qns.add(q_num)
 
         topic = cell_val(row, top_idx)
         if not topic or topic.strip().lower() in ("error", "none", "n/a", "nan"):
@@ -158,7 +166,17 @@ def parse_excel(uploaded_file) -> list[dict]:
             "quote":      cell_val(row, qut_idx, ""),
             "ref":        cell_val(row, ref_idx, ""),
         })
-    return rows
+
+    # Attach diagnostics so the UI can report what was deduplicated
+    rows_obj = list(rows)  # keep type as list[dict]
+    if duplicates:
+        # Stash duplicates list onto first row's metadata for display
+        # (returned alongside main rows via a dict wrapper would be cleaner,
+        # but keeping API stable: caller can read parse_excel.last_duplicates)
+        parse_excel.last_duplicates = sorted(set(duplicates))
+    else:
+        parse_excel.last_duplicates = []
+    return rows_obj
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -587,34 +605,101 @@ def classify_and_extract(client: anthropic.Anthropic, qp_b64: str,
     return results
 
 
+def extract_answers_pymupdf(ms_bytes: bytes) -> dict:
+    """Deterministic answer extraction from MS PDF using PyMuPDF + regex.
+       IB mark schemes typically format answers in a grid like:
+         1.  D       16.  C       31.  C
+         2.  A       17.  D       32.  B
+       This function scans every page line by line and captures
+       (question_number, answer_letter) pairs.
+       Returns: {qn_str: 'A'|'B'|'C'|'D'}
+    """
+    answers: dict = {}
+    try:
+        doc = fitz.open(stream=ms_bytes, filetype="pdf")
+    except Exception:
+        return {}
+
+    # Patterns ordered from strict → permissive.  We try each on each line.
+    patterns = [
+        # "1.  D" — most common (with dot)
+        re.compile(r"\b(\d{1,2})\.\s+([ABCD])(?![A-Za-z0-9])"),
+        # "1   D" — space-separated grid (no dot)
+        re.compile(r"(?:^|\s)(\d{1,2})\s{2,}([ABCD])(?![A-Za-z0-9])"),
+        # "Q1   D"
+        re.compile(r"\bQ\s*(\d{1,2})\s+([ABCD])(?![A-Za-z0-9])"),
+        # "1: D"
+        re.compile(r"\b(\d{1,2})\s*[:\-]\s*([ABCD])(?![A-Za-z0-9])"),
+    ]
+
+    for page in doc:
+        text = page.get_text()
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            for pat in patterns:
+                for m in pat.finditer(line):
+                    qn  = m.group(1)
+                    ans = m.group(2)
+                    if qn not in answers:
+                        answers[qn] = ans
+
+    doc.close()
+    return answers
+
+
 def extract_answers(client: anthropic.Anthropic, ms_b64: str,
-                    q_nums: list[int]) -> dict:
-    nums = ", ".join(str(n) for n in q_nums)
-    response = client.messages.create(
-        model="claude-opus-4-5",
-        max_tokens=2000,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "document",
-                 "source": {"type": "base64", "media_type": "application/pdf",
-                            "data": ms_b64}},
-                {"type": "text", "text": f"""Extract the correct answers for question numbers {nums} from this mark scheme.
+                    q_nums: list[int],
+                    ms_bytes: bytes = None) -> dict:
+    """Primary: deterministic PyMuPDF extraction (regex on text grid).
+       Fallback: Claude — only for question numbers that PyMuPDF didn't find.
+       The fallback is rare and inexpensive.
+    """
+    answers: dict = {}
 
-The mark scheme typically lists the answers like:
-  1. D    16. C    31. C
-  2. A    17. D    32. B
+    # 1) PyMuPDF deterministic pass
+    if ms_bytes is not None:
+        answers = extract_answers_pymupdf(ms_bytes)
 
-Return ONLY this JSON object — no markdown, no explanation:
-{{"1":"D","2":"A","3":"B",...}}
+    # 2) Claude fallback for whatever's still missing
+    missing = [n for n in q_nums if str(n) not in answers]
+    if missing and client is not None:
+        nums = ", ".join(str(n) for n in missing)
+        try:
+            response = client.messages.create(
+                model="claude-opus-4-5",
+                max_tokens=1500,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "document",
+                         "source": {"type": "base64",
+                                    "media_type": "application/pdf",
+                                    "data": ms_b64}},
+                        {"type": "text", "text": (
+                            f"Extract the correct answers for question numbers "
+                            f"{nums} from this IB mark scheme.\n\n"
+                            "The mark scheme is a grid of letters A–D.\n\n"
+                            "Return ONLY this JSON object — no markdown, no "
+                            "explanation:\n"
+                            '{"1":"D","2":"A",...}\n\n'
+                            'Use "NOT_FOUND" for any question that is genuinely '
+                            "absent."
+                        )},
+                    ],
+                }]
+            )
+            raw = "".join(b.text for b in response.content if hasattr(b, "text"))
+            data = safe_json(raw)
+            if isinstance(data, dict):
+                for k, v in data.items():
+                    if k not in answers and v in ("A", "B", "C", "D"):
+                        answers[k] = v
+        except Exception:
+            pass   # silent fallback — UI shows missing answers
 
-Use "NOT_FOUND" for any question not in the mark scheme."""}
-            ]
-        }]
-    )
-    raw = "".join(b.text for b in response.content if hasattr(b, "text"))
-    data = safe_json(raw)
-    return data if isinstance(data, dict) else {}
+    return answers
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -1066,8 +1151,17 @@ if st.button(
 
         q_nums = [r["qn"] for r in xl_rows]
         meta   = {r["qn"]: r for r in xl_rows}
-        st.write(f"✅ {len(q_nums)} questions in Excel "
+        st.write(f"✅ {len(q_nums)} unique questions in Excel "
                  f"(Q{', Q'.join(str(n) for n in q_nums[:6])}{'…' if len(q_nums) > 6 else ''})")
+
+        # Show duplicate Excel rows that were removed
+        dups = getattr(parse_excel, "last_duplicates", [])
+        if dups:
+            st.warning(
+                f"⚠ Removed {len(dups)} duplicate Excel rows for question(s): "
+                f"Q{', Q'.join(str(n) for n in dups)}.  "
+                "Only the first occurrence of each question was kept."
+            )
 
         # 2 — PyMuPDF coordinate detection
         st.write("📍 Locating questions in QP PDF…")
@@ -1096,15 +1190,25 @@ if st.button(
         visual_n  = sum(1 for q in qp_data if q.get("needs_image"))
         st.write(f"✅ {found_n}/{len(q_nums)} found · {visual_n} need cropped images")
 
-        # 4 — Mark Scheme
+        # 4 — Mark Scheme  (deterministic PyMuPDF + Claude fallback)
         st.write("🔑 Extracting answers from Mark Scheme PDF…")
         try:
-            ms_data = extract_answers(client, to_b64(ms_bytes), q_nums)
+            ms_data = extract_answers(client, to_b64(ms_bytes), q_nums,
+                                      ms_bytes=ms_bytes)
         except Exception as e:
             st.error(f"MS extraction failed: {e}")
             st.stop()
-        ans_n = sum(1 for v in ms_data.values() if v and v != "NOT_FOUND")
-        st.write(f"✅ {ans_n} answers extracted from MS")
+        ans_n = sum(1 for n in q_nums
+                    if ms_data.get(str(n)) in ("A", "B", "C", "D"))
+        st.write(f"✅ {ans_n}/{len(q_nums)} answers extracted from MS")
+        missing_ans = [n for n in q_nums
+                       if ms_data.get(str(n)) not in ("A", "B", "C", "D")]
+        if missing_ans:
+            st.warning(
+                f"⚠ {len(missing_ans)} answers not found in MS: "
+                f"Q{', Q'.join(str(n) for n in missing_ans[:15])}"
+                f"{'…' if len(missing_ans) > 15 else ''}"
+            )
 
         # 5 — Merge
         st.write("🔗 Merging…")
