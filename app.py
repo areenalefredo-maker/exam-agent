@@ -247,12 +247,94 @@ def find_question_locations(pdf_bytes: bytes) -> dict:
     # Sort by document order so we can compute each marker's bottom_y
     raw.sort(key=lambda e: (e[1], e[2]))
 
+    # Pre-compute per-page "content bottom" — the y of the last real content
+    # line before any footer (page number / copyright / "Turn over").
+    # This lets the LAST question on each page extend down to actual content
+    # rather than being clipped at an arbitrary fraction of page height.
+    doc2 = fitz.open(stream=pdf_bytes, filetype="pdf")
+    content_bottom_per_page: dict = {}
+
+    # Footer detection patterns — IB exam footers vary but include:
+    #   - "International Baccalaureate Organization 2022"
+    #   - "Turn over"
+    #   - "References:" section header (appears in May 2022 P2)
+    #   - Bare paper-number codes: "8821 – 6101", "2221 – 6113"
+    # NOTE: bare page numbers like "137" or "204" need extra y-check
+    # (they only count as footer when in the bottom strip of the page).
+    footer_pat = re.compile(
+        r"(international\s+baccalaureate|turn\s+over|references?\s*:|"
+        r"^\s*\d{4}\s*[\-\u2013]\s*\d{3,4}\s*$|"
+        r"^\s*[\-\u2013]\s*\d{1,3}\s*[\-\u2013]\s*$)",
+        re.IGNORECASE
+    )
+    # Bare page-number pattern (only counts as footer in bottom strip)
+    bare_num_pat = re.compile(r"^\s*\d{1,3}\s*$")
+
+    for pi in range(len(doc2)):
+        page = doc2[pi]
+        ph = page.rect.height
+        td = page.get_text("dict")
+        # Collect every line's (y0, y1, text)
+        lines_info = []
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                full = " ".join(s.get("text", "") for s in spans).strip()
+                if not full:
+                    continue
+                bb = line["bbox"]
+                lines_info.append((bb[1], bb[3], full))   # (y0, y1, text)
+
+        def is_footer(y0, txt):
+            """Context-aware footer detection."""
+            if footer_pat.search(txt):
+                return True
+            # Bare numbers count as footer ONLY in bottom 10% of page
+            if bare_num_pat.match(txt) and y0 > ph * 0.90:
+                return True
+            return False
+
+        # Find the FIRST footer line in the lower half of the page.
+        first_footer_y0 = ph * 0.92
+        for y0, y1, txt in sorted(lines_info, key=lambda t: t[0]):
+            if y0 < ph * 0.5:
+                continue
+            if is_footer(y0, txt):
+                first_footer_y0 = min(first_footer_y0, y0)
+                break
+
+        # Now find the last content line above that boundary
+        content_bottom = 0   # will accumulate max y1 of content lines
+        for y0, y1, txt in lines_info:
+            if is_footer(y0, txt):
+                continue
+            if y1 < first_footer_y0 - 2:
+                if y1 > content_bottom:
+                    content_bottom = y1
+
+        # If we never found any content, fall back to a safe ratio
+        if content_bottom == 0:
+            content_bottom = ph * 0.88
+
+        content_bottom_per_page[pi] = min(
+            content_bottom + 8,
+            first_footer_y0 - 6,
+        )
+
+    doc2.close()
+
     result = {}
     for i, (qn, page_idx, top_y, ph, pw, mrx) in enumerate(raw):
-        # bottom_y = next marker on SAME page, else page bottom
-        # IB papers have a footer (page number + copyright) around y=0.92.
-        # We cap bottom_y at 0.88 to definitively exclude the footer.
-        bottom_y = ph * 0.88
+        # Default bottom_y = the page's actual content bottom (not a fixed %)
+        bottom_y = content_bottom_per_page.get(page_idx, ph * 0.88)
+        # Hard ceiling at 0.92 to keep IB footer out even if detector missed
+        bottom_y = min(bottom_y, ph * 0.92)
+
+        # If there's a NEXT marker on the same page, bottom = that marker
         for j in range(i + 1, len(raw)):
             nq, np_idx, ntop, _, _, _ = raw[j]
             if np_idx == page_idx:
