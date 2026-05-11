@@ -742,6 +742,80 @@ def match_papers_to_references(
     return result
 
 
+def extract_answers_pymupdf_per_section(ms_bytes: bytes) -> list[dict]:
+    """Extract answers from MS PDF, grouped by section.
+
+    A 'section' = a contiguous range of MS pages that hold answers for ONE
+    paper. We detect section boundaries by looking for the answer-grid restart
+    (i.e. Q1 appearing again after a higher Q# was already seen).
+
+    Returns a list of section dicts:
+        [{"start_page": int_1based, "answers": {qn_str: 'A'|'B'|'C'|'D'}}, …]
+
+    Each section's `answers` covers ONE paper's Q1..Q40 (or whatever range).
+    The order of the list matches the document order — first paper's answers
+    come first.
+    """
+    sections: list[dict] = []
+    current: dict = {"start_page": 1, "answers": {}, "max_qn": 0}
+
+    try:
+        doc = fitz.open(stream=ms_bytes, filetype="pdf")
+    except Exception:
+        return []
+
+    patterns = [
+        re.compile(r"\b(\d{1,2})\.\s+([ABCD])(?![A-Za-z0-9])"),
+        re.compile(r"(?:^|\s)(\d{1,2})\s{2,}([ABCD])(?![A-Za-z0-9])"),
+        re.compile(r"\bQ\s*(\d{1,2})\s+([ABCD])(?![A-Za-z0-9])"),
+        re.compile(r"\b(\d{1,2})\s*[:\-]\s*([ABCD])(?![A-Za-z0-9])"),
+    ]
+
+    for page_idx, page in enumerate(doc):
+        text = page.get_text()
+        page_pairs = []  # (qn, ans) found on this page, in reading order
+        for line in text.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            for pat in patterns:
+                for m in pat.finditer(line):
+                    qn  = int(m.group(1))
+                    ans = m.group(2)
+                    if 1 <= qn <= 99:
+                        page_pairs.append((qn, ans))
+                        break   # one match per line is enough
+
+        for qn, ans in page_pairs:
+            qn_str = str(qn)
+            # Detect new paper: a lower Q# appearing after we already saw
+            # a higher Q# in this section (e.g. Q1 after we recorded Q35)
+            if (qn_str in current["answers"] or
+                    (current["max_qn"] >= 10 and qn < current["max_qn"] - 5)):
+                # Save current section, start a new one
+                if current["answers"]:
+                    sections.append({
+                        "start_page": current["start_page"],
+                        "end_page":   page_idx + 1,
+                        "answers":    current["answers"],
+                    })
+                current = {"start_page": page_idx + 1, "answers": {}, "max_qn": 0}
+
+            current["answers"][qn_str] = ans
+            if qn > current["max_qn"]:
+                current["max_qn"] = qn
+
+    if current["answers"]:
+        sections.append({
+            "start_page": current["start_page"],
+            "end_page":   len(doc),
+            "answers":    current["answers"],
+        })
+
+    doc.close()
+    return sections
+
+
 def extract_answers_pymupdf(ms_bytes: bytes) -> dict:
     """Deterministic answer extraction from MS PDF using PyMuPDF + regex.
        IB mark schemes typically format answers in a grid like:
@@ -1331,25 +1405,62 @@ if st.button(
         not_found_n = sum(1 for q in qp_data if not q.get("found"))
         st.write(f"✅ {visual_n} visual · {not_found_n} not found on specified page")
 
-        # ── 4) Mark Scheme (deterministic PyMuPDF) ───────────────────────────
+        # ── 4) Mark Scheme: extract per-section answers ──────────────────────
+        # The MS PDF may contain multiple papers concatenated. Each section
+        # holds answers for ONE paper (Q1..Q40). We detect Excel "segments"
+        # (one segment = a contiguous run of rows belonging to the same paper)
+        # and match Excel segments 1-to-1 with MS sections in document order.
         st.write("🔑 Extracting answers from Mark Scheme PDF…")
-        unique_qns = sorted({r["qn"] for r in xl_rows})
         try:
-            ms_data = extract_answers(client, to_b64(ms_bytes), unique_qns,
-                                      ms_bytes=ms_bytes)
+            ms_sections = extract_answers_pymupdf_per_section(ms_bytes)
         except Exception as e:
             st.error(f"MS extraction failed: {e}")
             st.stop()
-        ans_n = sum(1 for n in unique_qns
-                    if ms_data.get(str(n)) in ("A", "B", "C", "D"))
-        st.write(f"✅ {ans_n}/{len(unique_qns)} unique question numbers have answers in MS")
+        st.write(f"✅ Found {len(ms_sections)} answer section(s) in MS PDF")
+
+        # Detect Excel paper segments: a new segment starts whenever Q#
+        # drops back to 1 (or to a value much lower than the running max).
+        # Each segment is a list of row INDICES in xl_rows.
+        segments: list[list[int]] = []
+        current_seg: list[int] = []
+        max_qn = 0
+        for i, r in enumerate(xl_rows):
+            qn = r["qn"]
+            # New segment if Q# resets to 1 OR drops significantly
+            if current_seg and (qn == 1 or (max_qn >= 10 and qn < max_qn - 5)):
+                segments.append(current_seg)
+                current_seg = []
+                max_qn = 0
+            current_seg.append(i)
+            if qn > max_qn:
+                max_qn = qn
+        if current_seg:
+            segments.append(current_seg)
+
+        st.write(f"📚 Detected {len(segments)} paper segment(s) in Excel "
+                 f"(by Q# restart pattern)")
+
+        # Build row_idx → ms_section mapping by segment order
+        row_to_section: dict[int, dict | None] = {}
+        for seg_idx, seg_rows in enumerate(segments):
+            sec = ms_sections[seg_idx] if seg_idx < len(ms_sections) else None
+            for ri in seg_rows:
+                row_to_section[ri] = sec
+
+        if len(ms_sections) != len(segments):
+            st.warning(
+                f"⚠ Excel has {len(segments)} paper segment(s) but MS PDF "
+                f"yielded {len(ms_sections)} section(s). Some answers may be "
+                "missing or mismatched — review the validation table below."
+            )
 
         # ── 5) Merge — every Excel row gets its own per-row extraction ──────
         st.write("🔗 Merging per row…")
         questions: list[dict] = []
-        for r, qp_q in zip(xl_rows, qp_data):
+        for i, (r, qp_q) in enumerate(zip(xl_rows, qp_data)):
             n = r["qn"]
-            ans  = ms_data.get(str(n), "")
+            sec = row_to_section.get(i)
+            ans = (sec["answers"].get(str(n), "") if sec else "")
             ans_ok = ans in ("A", "B", "C", "D")
             found_q   = bool(qp_q) and qp_q.get("found") is not False
             needs_img = found_q and qp_q.get("needs_image", False)
@@ -1385,16 +1496,24 @@ if st.button(
 
     st.dataframe(
         [{
+            "Excel Row":  i + 2,   # +2 because header row + 1-based
             "Q#":         q["qn"],
             "Reference":  q.get("ref", ""),
             "Page":       q.get("page_num", ""),
             "Chapter":    q.get("topic", ""),
             "Difficulty": q.get("difficulty", ""),
             "Marks":      q.get("marks", ""),
-            "Type":       "🖼" if q["needs_image"] else "📝",
+            "Type":       "🖼 Image" if q["needs_image"] else "📝 Text",
+            "First line of extracted":
+                (q.get("text", "")[:60] + "…") if q.get("text") and len(q.get("text", "")) > 60
+                else (q.get("text", "") or ("[image — see crop]" if q["needs_image"]
+                      else "[not found]")),
             "Answer":     q["answer"] if q["answerFound"] else "—",
-            "Found?":     "✅" if q["found"] else "❌",
-        } for q in questions],
+            "Status":     ("✅" if q["found"] and q["answerFound"]
+                           else ("⚠ MS missing" if q["found"]
+                                 else ("⚠ QP missing" if q["answerFound"]
+                                       else "❌ both missing"))),
+        } for i, q in enumerate(questions)],
         use_container_width=True,
         hide_index=True,
     )
