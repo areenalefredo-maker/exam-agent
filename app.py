@@ -742,19 +742,44 @@ def match_papers_to_references(
     return result
 
 
+def _extract_qn_ans_pairs(text: str) -> list[tuple]:
+    """Extract every (qn, answer_letter) pair from a chunk of MS text.
+
+    Handles all common IB mark-scheme formats:
+        '1.  D'    '1   D'    'Q1  D'    '1: D'
+        '1)  D'    '1 D'      '1.D'      '  1.D'
+
+    Returns pairs in reading order (left-to-right, top-to-bottom).
+    Does NOT match digits inside option text (e.g. 'D 1.5' won't be parsed
+    as Q1=… because the digit must come before the letter).
+    """
+    pattern = re.compile(
+        r"(?:^|[\s\|])"            # start of line or after whitespace/pipe
+        r"(?:Q\s*)?"               # optional 'Q' prefix
+        r"(\d{1,2})"               # question number
+        r"[\.\):]?"                # optional . ) :
+        r"\s*"                     # zero or more spaces (allow '1.D')
+        r"([ABCD])"                # answer letter
+        r"(?=$|[\s\.\,\;\|])"      # boundary after letter
+    )
+    pairs = []
+    for m in pattern.finditer(text):
+        qn = int(m.group(1))
+        if 1 <= qn <= 99:
+            pairs.append((qn, m.group(2)))
+    return pairs
+
+
 def extract_answers_pymupdf_per_section(ms_bytes: bytes) -> list[dict]:
     """Extract answers from MS PDF, grouped by section.
 
     A 'section' = a contiguous range of MS pages that hold answers for ONE
     paper. We detect section boundaries by looking for the answer-grid restart
-    (i.e. Q1 appearing again after a higher Q# was already seen).
+    (i.e. Q1 appearing again, OR any Q# appearing twice).
 
-    Returns a list of section dicts:
-        [{"start_page": int_1based, "answers": {qn_str: 'A'|'B'|'C'|'D'}}, …]
-
-    Each section's `answers` covers ONE paper's Q1..Q40 (or whatever range).
-    The order of the list matches the document order — first paper's answers
-    come first.
+    Returns:
+        [{"start_page": int_1based, "end_page": int,
+          "answers": {qn_str: 'A'|'B'|'C'|'D'}}, …]
     """
     sections: list[dict] = []
     current: dict = {"start_page": 1, "answers": {}, "max_qn": 0}
@@ -764,41 +789,32 @@ def extract_answers_pymupdf_per_section(ms_bytes: bytes) -> list[dict]:
     except Exception:
         return []
 
-    patterns = [
-        re.compile(r"\b(\d{1,2})\.\s+([ABCD])(?![A-Za-z0-9])"),
-        re.compile(r"(?:^|\s)(\d{1,2})\s{2,}([ABCD])(?![A-Za-z0-9])"),
-        re.compile(r"\bQ\s*(\d{1,2})\s+([ABCD])(?![A-Za-z0-9])"),
-        re.compile(r"\b(\d{1,2})\s*[:\-]\s*([ABCD])(?![A-Za-z0-9])"),
-    ]
-
     for page_idx, page in enumerate(doc):
+        # Try the page text as-is first (PyMuPDF preserves visual order
+        # reasonably well for grid layouts).
         text = page.get_text()
-        page_pairs = []  # (qn, ans) found on this page, in reading order
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            for pat in patterns:
-                for m in pat.finditer(line):
-                    qn  = int(m.group(1))
-                    ans = m.group(2)
-                    if 1 <= qn <= 99:
-                        page_pairs.append((qn, ans))
-                        break   # one match per line is enough
+        page_pairs = _extract_qn_ans_pairs(text)
+
+        # Skip pages that look like prose (mostly text, few qn matches).
+        # Real answer-grid pages have many short lines with N. X patterns.
+        if len(page_pairs) < 3:
+            continue
 
         for qn, ans in page_pairs:
             qn_str = str(qn)
-            # Detect new paper: a lower Q# appearing after we already saw
-            # a higher Q# in this section (e.g. Q1 after we recorded Q35)
-            if (qn_str in current["answers"] or
-                    (current["max_qn"] >= 10 and qn < current["max_qn"] - 5)):
-                # Save current section, start a new one
-                if current["answers"]:
-                    sections.append({
-                        "start_page": current["start_page"],
-                        "end_page":   page_idx + 1,
-                        "answers":    current["answers"],
-                    })
+            # New paper boundary detection:
+            #  - the same qn appears again, OR
+            #  - qn resets to 1 after we already saw qn >= 5
+            is_boundary = (
+                qn_str in current["answers"]
+                or (qn == 1 and current["max_qn"] >= 5)
+            )
+            if is_boundary and current["answers"]:
+                sections.append({
+                    "start_page": current["start_page"],
+                    "end_page":   page_idx + 1,
+                    "answers":    current["answers"],
+                })
                 current = {"start_page": page_idx + 1, "answers": {}, "max_qn": 0}
 
             current["answers"][qn_str] = ans
@@ -817,46 +833,15 @@ def extract_answers_pymupdf_per_section(ms_bytes: bytes) -> list[dict]:
 
 
 def extract_answers_pymupdf(ms_bytes: bytes) -> dict:
-    """Deterministic answer extraction from MS PDF using PyMuPDF + regex.
-       IB mark schemes typically format answers in a grid like:
-         1.  D       16.  C       31.  C
-         2.  A       17.  D       32.  B
-       This function scans every page line by line and captures
-       (question_number, answer_letter) pairs.
-       Returns: {qn_str: 'A'|'B'|'C'|'D'}
+    """Flat extraction — returns the union of all answers in all sections,
+    using first-occurrence resolution for duplicates. Kept for backward
+    compatibility with single-paper callers.
     """
+    sections = extract_answers_pymupdf_per_section(ms_bytes)
     answers: dict = {}
-    try:
-        doc = fitz.open(stream=ms_bytes, filetype="pdf")
-    except Exception:
-        return {}
-
-    # Patterns ordered from strict → permissive.  We try each on each line.
-    patterns = [
-        # "1.  D" — most common (with dot)
-        re.compile(r"\b(\d{1,2})\.\s+([ABCD])(?![A-Za-z0-9])"),
-        # "1   D" — space-separated grid (no dot)
-        re.compile(r"(?:^|\s)(\d{1,2})\s{2,}([ABCD])(?![A-Za-z0-9])"),
-        # "Q1   D"
-        re.compile(r"\bQ\s*(\d{1,2})\s+([ABCD])(?![A-Za-z0-9])"),
-        # "1: D"
-        re.compile(r"\b(\d{1,2})\s*[:\-]\s*([ABCD])(?![A-Za-z0-9])"),
-    ]
-
-    for page in doc:
-        text = page.get_text()
-        for line in text.split("\n"):
-            line = line.strip()
-            if not line:
-                continue
-            for pat in patterns:
-                for m in pat.finditer(line):
-                    qn  = m.group(1)
-                    ans = m.group(2)
-                    if qn not in answers:
-                        answers[qn] = ans
-
-    doc.close()
+    for sec in sections:
+        for q, a in sec["answers"].items():
+            answers.setdefault(q, a)
     return answers
 
 
@@ -1442,10 +1427,12 @@ if st.button(
 
         # Build row_idx → ms_section mapping by segment order
         row_to_section: dict[int, dict | None] = {}
+        row_to_section_idx: dict[int, int] = {}
         for seg_idx, seg_rows in enumerate(segments):
             sec = ms_sections[seg_idx] if seg_idx < len(ms_sections) else None
             for ri in seg_rows:
                 row_to_section[ri] = sec
+                row_to_section_idx[ri] = seg_idx
 
         if len(ms_sections) != len(segments):
             st.warning(
@@ -1460,14 +1447,20 @@ if st.button(
         for i, (r, qp_q) in enumerate(zip(xl_rows, qp_data)):
             n = r["qn"]
             sec = row_to_section.get(i)
+            sec_idx = row_to_section_idx.get(i, -1)
             ans = (sec["answers"].get(str(n), "") if sec else "")
             ans_ok = ans in ("A", "B", "C", "D")
             found_q   = bool(qp_q) and qp_q.get("found") is not False
             needs_img = found_q and qp_q.get("needs_image", False)
 
+            sec_label = (f"MS section {sec_idx+1}"
+                         + (f" (pp.{sec['start_page']}–{sec['end_page']})"
+                            if sec else "")) if sec_idx >= 0 else "no section"
+
             questions.append({
                 **r,
-                "_loc":        qp_q.get("_loc"),       # per-row location
+                "_loc":        qp_q.get("_loc"),
+                "_ms_section": sec_label,
                 "found":       found_q,
                 "needs_image": needs_img,
                 "text":        qp_q.get("text", "")  if found_q else "",
@@ -1496,10 +1489,11 @@ if st.button(
 
     st.dataframe(
         [{
-            "Excel Row":  i + 2,   # +2 because header row + 1-based
+            "Excel Row":  i + 2,
             "Q#":         q["qn"],
             "Reference":  q.get("ref", ""),
             "Page":       q.get("page_num", ""),
+            "MS Section": q.get("_ms_section", ""),
             "Chapter":    q.get("topic", ""),
             "Difficulty": q.get("difficulty", ""),
             "Marks":      q.get("marks", ""),
