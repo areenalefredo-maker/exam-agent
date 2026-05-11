@@ -190,16 +190,26 @@ def parse_excel(uploaded_file) -> list[dict]:
 
 
 # ───────────────────────────────────────────────────────────────────────────────
-#  PYMUPDF  →  find every question's bounding box
+#  PYMUPDF  →  find EVERY occurrence of every "N." marker in the PDF
 # ───────────────────────────────────────────────────────────────────────────────
 def find_question_locations(pdf_bytes: bytes) -> dict:
-    """Scan all pages of the QP PDF and locate each question by its 'N.' marker.
-    Returns: {q_num: {"page_idx": int, "top_y": float, "bottom_y": float,
-                      "page_height": float, "page_width": float}}
-    Coordinates are in PDF points (top-left origin).
+    """Scan all pages of the QP PDF and locate EVERY question marker.
+
+    Critical: when the QP PDF contains multiple papers concatenated, the
+    same question number (e.g. Q1) appears once per paper. We MUST keep
+    every occurrence — not just the first — so that callers can pick the
+    right Q1 by page number.
+
+    Returns a dict keyed by (page_idx_1based, q_num):
+        {(page_idx, q_num): {"page_idx": int,    # 0-based
+                             "top_y": float,
+                             "bottom_y": float,
+                             "page_height": float,
+                             "page_width": float,
+                             "marker_right_x": float}}
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    raw = []  # list of (q_num, page_idx, top_y, page_height, page_width)
+    raw = []   # (q_num, page_idx_0based, top_y, page_h, page_w, marker_right_x)
 
     pat = re.compile(r"^(\d+)\.$")
 
@@ -216,68 +226,104 @@ def find_question_locations(pdf_bytes: bytes) -> dict:
                 if not spans:
                     continue
 
-                # Concatenate first 1-2 spans to catch "1." cleanly
                 first_text = spans[0].get("text", "").strip()
-                bbox = line["bbox"]   # (x0, y0, x1, y1)
+                bbox = line["bbox"]
 
-                # Question marker = "N." at left margin (x0 < 100 pt typical),
-                # font is usually bold (size ≥ 9 pt)
                 m = pat.match(first_text)
                 if not m:
                     continue
-                if bbox[0] > 110:        # too far from left margin → not a marker
+                if bbox[0] > 110:
                     continue
 
                 q_num = int(m.group(1))
-                # Ignore obviously non-question numbers (e.g. >100 unlikely)
                 if q_num < 1 or q_num > 99:
                     continue
 
-                # Right edge of the "N." marker — used to skip the
-                # question-number column when cropping the image.
                 marker_right_x = spans[0]["bbox"][2]
-
                 raw.append((q_num, page_idx, bbox[1], ph, pw, marker_right_x))
 
     doc.close()
 
-    # Keep only the first occurrence per question number
-    seen, ordered = set(), []
-    for entry in raw:
-        if entry[0] not in seen:
-            seen.add(entry[0])
-            ordered.append(entry)
-
-    # Sort by document order (page, then top_y)
-    ordered.sort(key=lambda e: (e[1], e[2]))
+    # Sort by document order so we can compute each marker's bottom_y
+    raw.sort(key=lambda e: (e[1], e[2]))
 
     result = {}
-    for i, (qn, page_idx, top_y, ph, pw, mrx) in enumerate(ordered):
-        # Determine bottom_y: next question marker on SAME page, else page bottom
-        bottom_y = ph * 0.94          # default: avoid footer
-        for j in range(i + 1, len(ordered)):
-            nq, np_idx, ntop, _, _, _ = ordered[j]
+    for i, (qn, page_idx, top_y, ph, pw, mrx) in enumerate(raw):
+        # bottom_y = next marker on SAME page, else page bottom
+        bottom_y = ph * 0.94
+        for j in range(i + 1, len(raw)):
+            nq, np_idx, ntop, _, _, _ = raw[j]
             if np_idx == page_idx:
                 bottom_y = ntop - 4
                 break
             if np_idx > page_idx:
                 break
 
-        result[qn] = {
+        # Use 1-based page number for the key (matches Excel "Page Number")
+        page_1based = page_idx + 1
+        key = (page_1based, qn)
+
+        # If the same (page, qn) appears twice (extremely rare), keep first
+        if key in result:
+            continue
+
+        result[key] = {
             "page_idx":       page_idx,
             "top_y":          top_y,
             "bottom_y":       bottom_y,
             "page_height":    ph,
             "page_width":     pw,
-            "marker_right_x": mrx,   # PDF points
+            "marker_right_x": mrx,
         }
+
     return result
 
 
-def crop_question_png(pdf_bytes: bytes, locations: dict, q_num: int,
+def find_question_for_excel_row(
+    locations: dict,           # {(page, qn): {...}}
+    q_num: int,
+    excel_page: int,
+    tolerance: int = 3,        # tolerate ±N pages of mismatch
+) -> dict | None:
+    """Pick the right `locations` entry for an Excel row.
+
+    Strategy:
+      1) Exact match on (excel_page, q_num)
+      2) Within ±tolerance pages of excel_page — pick the nearest
+      3) Otherwise → None (caller decides: error / fallback)
+    """
+    if excel_page and excel_page > 0:
+        # Try exact match first
+        if (excel_page, q_num) in locations:
+            return locations[(excel_page, q_num)]
+
+        # Try nearby pages (text-layer offsets, page-number mismatches)
+        candidates = [
+            (abs(p - excel_page), p)
+            for (p, qn) in locations
+            if qn == q_num and abs(p - excel_page) <= tolerance
+        ]
+        if candidates:
+            candidates.sort()  # nearest first
+            _, p = candidates[0]
+            return locations[(p, q_num)]
+
+        # No match within tolerance → caller handles
+        return None
+
+    # No page hint in Excel — best-effort: use first occurrence of this qn
+    for (p, qn), loc in sorted(locations.items()):
+        if qn == q_num:
+            return loc
+    return None
+
+
+def crop_question_png(pdf_bytes: bytes, loc: dict, q_num: int = None,
                       dpi: int = 200) -> bytes | None:
-    """Crop the question area from the QP PDF and return PNG bytes."""
-    loc = locations.get(q_num)
+    """Crop the question area from the QP PDF and return PNG bytes.
+       `loc` is now a single location dict (from find_question_for_excel_row),
+       NOT the full locations dict.
+    """
     if not loc:
         return None
 
@@ -312,19 +358,16 @@ def crop_question_png(pdf_bytes: bytes, locations: dict, q_num: int,
 #  CLAUDE  →  classify (visual?) + extract text for text-only questions
 # ───────────────────────────────────────────────────────────────────────────────
 def classify_and_extract(client: anthropic.Anthropic, qp_b64: str,
-                         q_nums: list[int],
+                         q_nums_or_rows,
                          qp_bytes: bytes = None,
                          locations: dict = None) -> list[dict]:
     """Deterministic extraction using PyMuPDF — no Claude calls, no placeholders.
-       For each question:
-         - found:        true if located in the QP
-         - needs_image:  true if the question has visual content (drawings,
-                         images, or sparse text → use cropped image)
-         - text/A/B/C/D: extracted verbatim from the PDF for text-only questions
-                         (empty strings for visual questions)
 
-       The `client` and `qp_b64` parameters are kept for backward compatibility
-       but ignored; we use `qp_bytes` + `locations` instead.
+    `q_nums_or_rows` may be:
+      - a list of ints — legacy single-paper mode, will lookup the first
+        occurrence of each q_num in locations
+      - a list of (q_num, excel_page) tuples — preferred for multi-paper:
+        each Excel row is matched to its specific page in the PDF
     """
     if qp_bytes is None or locations is None:
         return []
@@ -332,12 +375,18 @@ def classify_and_extract(client: anthropic.Anthropic, qp_b64: str,
     doc = fitz.open(stream=qp_bytes, filetype="pdf")
     results = []
 
-    for q_num in q_nums:
-        loc = locations.get(q_num)
+    for entry in q_nums_or_rows:
+        if isinstance(entry, tuple):
+            q_num, excel_page = entry
+        else:
+            q_num, excel_page = entry, 0
+
+        loc = find_question_for_excel_row(locations, q_num, excel_page)
         if not loc:
             results.append({
                 "qn": q_num, "found": False, "needs_image": False,
                 "text": "", "A": "", "B": "", "C": "", "D": "",
+                "_loc": None, "_excel_page": excel_page,
             })
             continue
 
@@ -609,6 +658,8 @@ def classify_and_extract(client: anthropic.Anthropic, qp_b64: str,
             "text":        stem,
             "A": options["A"], "B": options["B"],
             "C": options["C"], "D": options["D"],
+            "_loc":        loc,                # picked location dict
+            "_excel_page": excel_page,
         })
 
     doc.close()
@@ -1121,7 +1172,7 @@ def build_word_document(
                 # ── Body: image OR text ────────────────────────────────────────
                 if not found:
                     np_ = doc.add_paragraph()
-                    _run(np_, "Question not found in uploaded Question Paper",
+                    _run(np_, "Question not found on specified page - needs review",
                          italic=True, size_pt=11)
 
                 elif vis:
@@ -1129,13 +1180,10 @@ def build_word_document(
                         progress_cb(img_done + 1, total_imgs or 1,
                                     f"Cropping Q{q_num} from QP…")
                     img_done += 1
-                    # Each question carries its own QP context (bytes + locs)
-                    # so we can crop from the right paper when the worksheet
-                    # mixes questions from multiple QPs.
-                    q_qp_bytes = q.get("_qp_bytes") or qp_bytes
-                    q_locs     = q.get("_qp_locs")  or locations or {}
-                    img_bytes = crop_question_png(q_qp_bytes, q_locs, q_num) \
-                                if q_qp_bytes else None
+                    # Use the per-row location (matched by Excel page number)
+                    # so the right occurrence of Q# is cropped from the PDF.
+                    q_loc = q.get("_loc")
+                    img_bytes = crop_question_png(qp_bytes, q_loc) if q_loc else None
                     if img_bytes:
                         ip = doc.add_paragraph()
                         ip.paragraph_format.space_before = Pt(0)
@@ -1262,25 +1310,30 @@ if st.button(
         except Exception as e:
             st.error(f"Failed to scan QP PDF: {e}")
             st.stop()
-        st.write(f"✅ Located {len(locations)} question numbers in QP")
+        st.write(f"✅ Found {len(locations)} question marker(s) in QP across all pages")
 
-        # ── 3) Extract text + classify (visual vs text-only) ─────────────────
-        st.write("🔍 Extracting question text from QP…")
-        unique_qns = sorted({r["qn"] for r in xl_rows})
+        # ── 3) Extract text + classify per-Excel-row using (qn, page) ───────
+        # CRITICAL: We pass tuples of (q_num, excel_page) so the extractor can
+        # disambiguate when the same Q# appears in multiple papers within one PDF.
+        st.write("🔍 Extracting question text per row…")
+        row_tuples = [(r["qn"], r.get("page_num", 0)) for r in xl_rows]
         try:
             qp_data = classify_and_extract(
-                None, "", unique_qns,
+                None, "", row_tuples,
                 qp_bytes=qp_bytes, locations=locations,
             )
         except Exception as e:
             st.error(f"QP extraction failed: {e}")
             st.stop()
-        qp_by_qn = {int(q["qn"]): q for q in qp_data}
+
+        # qp_data is aligned 1:1 with xl_rows (same order)
         visual_n = sum(1 for q in qp_data if q.get("needs_image"))
-        st.write(f"✅ {visual_n} question(s) flagged as visual (will use cropped image)")
+        not_found_n = sum(1 for q in qp_data if not q.get("found"))
+        st.write(f"✅ {visual_n} visual · {not_found_n} not found on specified page")
 
         # ── 4) Mark Scheme (deterministic PyMuPDF) ───────────────────────────
         st.write("🔑 Extracting answers from Mark Scheme PDF…")
+        unique_qns = sorted({r["qn"] for r in xl_rows})
         try:
             ms_data = extract_answers(client, to_b64(ms_bytes), unique_qns,
                                       ms_bytes=ms_bytes)
@@ -1289,21 +1342,21 @@ if st.button(
             st.stop()
         ans_n = sum(1 for n in unique_qns
                     if ms_data.get(str(n)) in ("A", "B", "C", "D"))
-        st.write(f"✅ {ans_n}/{len(unique_qns)} answers extracted from MS")
+        st.write(f"✅ {ans_n}/{len(unique_qns)} unique question numbers have answers in MS")
 
-        # ── 5) Merge — keep EVERY Excel row (no Q#-based dedup) ─────────────
-        st.write("🔗 Merging…")
+        # ── 5) Merge — every Excel row gets its own per-row extraction ──────
+        st.write("🔗 Merging per row…")
         questions: list[dict] = []
-        for r in xl_rows:
+        for r, qp_q in zip(xl_rows, qp_data):
             n = r["qn"]
-            qp_q = qp_by_qn.get(n, {})
             ans  = ms_data.get(str(n), "")
             ans_ok = ans in ("A", "B", "C", "D")
-            found_q = bool(qp_q) and qp_q.get("found") is not False
-            needs_img = qp_q.get("needs_image", False) and (n in locations)
+            found_q   = bool(qp_q) and qp_q.get("found") is not False
+            needs_img = found_q and qp_q.get("needs_image", False)
 
             questions.append({
                 **r,
+                "_loc":        qp_q.get("_loc"),       # per-row location
                 "found":       found_q,
                 "needs_image": needs_img,
                 "text":        qp_q.get("text", "")  if found_q else "",
@@ -1311,7 +1364,7 @@ if st.button(
                 "B":           qp_q.get("B", "")     if found_q else "",
                 "C":           qp_q.get("C", "")     if found_q else "",
                 "D":           qp_q.get("D", "")     if found_q else "",
-                "answer":      ans if ans_ok else "Answer not found in uploaded Mark Scheme",
+                "answer":      ans if ans_ok else "Answer not found - needs review",
                 "answerFound": ans_ok,
             })
 
