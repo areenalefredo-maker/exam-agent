@@ -56,6 +56,24 @@ with c2:
 
 st.divider()
 
+# ── Mode selector ──────────────────────────────────────────────────────────
+mode = st.radio(
+    "Processing mode",
+    options=["MCQ Mode", "Structured Mark Scheme Mode"],
+    horizontal=True,
+    key="mode",
+    help=(
+        "**MCQ Mode** — for Chemistry / Biology Paper 1 style. Mark Scheme is "
+        "a grid of A/B/C/D answers.\n\n"
+        "**Structured Mark Scheme Mode** — for Mathematics or any subject with "
+        "full worked solutions (M1/A1/R1 marks, steps, diagrams). The Mark "
+        "Scheme is extracted as a cropped image from the MS PDF for each "
+        "question."
+    ),
+)
+
+st.divider()
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  HELPERS
@@ -929,6 +947,196 @@ def extract_answers_pymupdf(ms_bytes: bytes) -> dict:
     return answers
 
 
+# ───────────────────────────────────────────────────────────────────────────────
+#  STRUCTURED MARK SCHEME (Math / Bio with worked solutions)
+# ───────────────────────────────────────────────────────────────────────────────
+def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
+    """For structured MS (e.g. Math): find every question's bounding box
+    across all pages of the MS PDF.
+
+    Math MS layout differs from QP — markers can be:
+      "1.", "2.", "3." (start of line, in body or table)
+      "1)", "2)" sometimes
+      "1." in big bold at left margin
+    A question's content extends down to the next question marker.
+
+    Returns a list of section dicts, one per detected MS paper:
+        [{"start_page": int, "end_page": int,
+          "questions": {qn: {"page_idx": int, "top_y": float,
+                             "bottom_y": float, "end_page_idx": int,
+                             "end_y": float}}}, …]
+
+    `end_page_idx` and `end_y` together mark where the question stops
+    (it may span across pages).
+    """
+    try:
+        doc = fitz.open(stream=ms_bytes, filetype="pdf")
+    except Exception:
+        return []
+
+    # Step 1: scan every page for "N." markers near the left margin
+    # MS markers can be "1." alone OR "1.   Solve 2x..." at start of line
+    pat = re.compile(r"^(\d+)\.\s*")
+    raw_markers = []   # (qn, page_idx, top_y, page_height)
+    for pi in range(len(doc)):
+        page = doc[pi]
+        ph = page.rect.height
+        td = page.get_text("dict")
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                # Combine all span text on this line (sometimes "1." and
+                # "Solve…" are separate spans)
+                full_line = "".join(s.get("text", "") for s in spans)
+                bb = line["bbox"]
+                m = pat.match(full_line)
+                if not m:
+                    continue
+                if bb[0] > 120:   # not left-margin marker
+                    continue
+                qn = int(m.group(1))
+                if qn < 1 or qn > 99:
+                    continue
+                raw_markers.append((qn, pi, bb[1], ph))
+
+    doc.close()
+
+    if not raw_markers:
+        return []
+
+    # Step 2: split into sections by Q# restart pattern
+    sections: list[dict] = []
+    current: dict = {"questions": {}, "_order": [],
+                     "start_page": raw_markers[0][1] + 1, "max_qn": 0}
+
+    for qn, pi, top_y, ph in raw_markers:
+        # New section if qn repeats OR resets to 1 after Q ≥ 5
+        if (qn in current["questions"] or
+                (qn == 1 and current["max_qn"] >= 5)):
+            if current["questions"]:
+                sections.append(current)
+                current = {"questions": {}, "_order": [],
+                           "start_page": pi + 1, "max_qn": 0}
+
+        current["questions"][qn] = {
+            "page_idx":     pi,
+            "top_y":        top_y,
+            "bottom_y":     ph * 0.92,   # tentative — refined below
+            "end_page_idx": pi,
+            "end_y":        ph * 0.92,
+            "page_height":  ph,
+        }
+        current["_order"].append((qn, pi, top_y))
+        if qn > current["max_qn"]:
+            current["max_qn"] = qn
+
+    if current["questions"]:
+        sections.append(current)
+
+    # Step 3: for each section, compute each question's end (where next
+    # question begins, possibly on a later page)
+    for sec in sections:
+        order = sec["_order"]
+        for idx, (qn, pi, top_y) in enumerate(order):
+            if idx + 1 < len(order):
+                next_qn, next_pi, next_top_y = order[idx + 1]
+                if next_pi == pi:
+                    # Next question on same page → end_y is just above it
+                    sec["questions"][qn]["end_page_idx"] = pi
+                    sec["questions"][qn]["end_y"] = next_top_y - 4
+                else:
+                    # Next question on later page → this question ends
+                    # at bottom of its starting page (and may span pages)
+                    sec["questions"][qn]["end_page_idx"] = next_pi
+                    sec["questions"][qn]["end_y"] = next_top_y - 4
+            # else: last question in section → keeps tentative bottom
+
+        # Set section's end_page
+        last_qn, last_pi, _ = order[-1]
+        sec["end_page"] = sec["questions"][last_qn]["end_page_idx"] + 1
+        # Remove internal _order key
+        sec.pop("_order", None)
+
+    return sections
+
+
+def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
+                           dpi: int = 150) -> bytes | None:
+    """Crop the worked solution for one MS question.
+
+    The question may span multiple pages. We render each spanned page,
+    stack them vertically into one tall image, and return PNG bytes.
+    """
+    if not q_info:
+        return None
+
+    start_pi = q_info["page_idx"]
+    end_pi   = q_info.get("end_page_idx", start_pi)
+    start_y  = q_info["top_y"]
+    end_y    = q_info["end_y"]
+
+    try:
+        doc = fitz.open(stream=ms_bytes, filetype="pdf")
+    except Exception:
+        return None
+
+    scale = dpi / 72
+    pieces = []
+
+    for pi in range(start_pi, end_pi + 1):
+        if pi >= len(doc):
+            break
+        page = doc[pi]
+        ph = page.rect.height
+        mat = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        full = Image.open(io.BytesIO(pix.tobytes("png")))
+        iw, ih = full.size
+
+        if pi == start_pi and pi == end_pi:
+            # Single-page question
+            top_px = max(0,  int(start_y * scale) - 10)
+            bot_px = min(ih, int(end_y   * scale) + 5)
+        elif pi == start_pi:
+            # First page of multi-page question
+            top_px = max(0,  int(start_y * scale) - 10)
+            bot_px = min(ih, int(ph * 0.92 * scale))   # to footer
+        elif pi == end_pi:
+            # Last page of multi-page question
+            top_px = int(ph * 0.05 * scale)   # skip header
+            bot_px = min(ih, int(end_y * scale) + 5)
+        else:
+            # Middle page — keep entire content area
+            top_px = int(ph * 0.05 * scale)
+            bot_px = int(ph * 0.92 * scale)
+
+        if bot_px <= top_px:
+            continue
+        pieces.append(full.crop((0, top_px, iw, bot_px)))
+
+    doc.close()
+
+    if not pieces:
+        return None
+
+    # Stack vertically
+    total_w = max(p.size[0] for p in pieces)
+    total_h = sum(p.size[1] for p in pieces)
+    stacked = Image.new("RGB", (total_w, total_h), "white")
+    y = 0
+    for p in pieces:
+        stacked.paste(p, (0, y))
+        y += p.size[1]
+
+    buf = io.BytesIO()
+    stacked.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
 def extract_answers(client: anthropic.Anthropic, ms_b64: str,
                     q_nums: list[int],
                     ms_bytes: bytes = None) -> dict:
@@ -1234,17 +1442,15 @@ def build_word_document(
                 _run(qh, f"Question: {display_num}", bold=True, size_pt=13)
 
                 # ── Meta line ─────────────────────────────────────────────────
-                # **Level of question**: Easy  |  **Number of Marks: **1  |
-                # **Reference:** (xxx)  |
+                # **Level of question**: Easy  |  **Number of Marks: **1
+                # (Reference is used internally for matching, NOT shown.)
                 mp = doc.add_paragraph()
                 mp.paragraph_format.space_before = Pt(0)
                 mp.paragraph_format.space_after  = Pt(2)
                 _run(mp, "Level of question",  bold=True, size_pt=11)
                 _run(mp, f": {diff_}  |  ",                size_pt=11)
                 _run(mp, "Number of Marks: ",  bold=True, size_pt=11)
-                _run(mp, f"{marks}  |  ",                  size_pt=11)
-                _run(mp, "Reference:",         bold=True, size_pt=11)
-                _run(mp, f" {ref}  |",                     size_pt=11)
+                _run(mp, f"{marks}",                       size_pt=11)
 
                 # ── Chapter line ──────────────────────────────────────────────
                 # **Chapter** :  [name]
@@ -1382,10 +1588,19 @@ def build_word_document(
                 ap.paragraph_format.space_after  = Pt(2)
                 _run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
-                av = doc.add_paragraph()
-                av.paragraph_format.space_before = Pt(0)
-                av.paragraph_format.space_after  = Pt(2)
-                _run(av, answer, bold=True, size_pt=12)
+                # Structured mode: MS image (full worked solution) when present
+                ms_img_bytes = q.get("_ms_image")
+                if ms_img_bytes:
+                    aip = doc.add_paragraph()
+                    aip.paragraph_format.space_before = Pt(0)
+                    aip.paragraph_format.space_after  = Pt(2)
+                    aip.add_run().add_picture(io.BytesIO(ms_img_bytes),
+                                              width=Cm(CONTENT_WIDTH_CM - 1.0))
+                else:
+                    av = doc.add_paragraph()
+                    av.paragraph_format.space_before = Pt(0)
+                    av.paragraph_format.space_after  = Pt(2)
+                    _run(av, answer, bold=True, size_pt=12)
 
                 # ── Separator before Keep it up ────────────────────────────────
                 _hr(doc, color="BFBFBF")
@@ -1474,28 +1689,38 @@ if st.button(
         not_found_n = sum(1 for q in qp_data if not q.get("found"))
         st.write(f"✅ {visual_n} visual · {not_found_n} not found on specified page")
 
-        # ── 4) Mark Scheme: extract per-section answers ──────────────────────
-        # The MS PDF may contain multiple papers concatenated. Each section
-        # holds answers for ONE paper (Q1..Q40). We detect Excel "segments"
-        # (one segment = a contiguous run of rows belonging to the same paper)
-        # and match Excel segments 1-to-1 with MS sections in document order.
-        st.write("🔑 Extracting answers from Mark Scheme PDF…")
-        try:
-            ms_sections = extract_answers_pymupdf_per_section(ms_bytes)
-        except Exception as e:
-            st.error(f"MS extraction failed: {e}")
-            st.stop()
-        st.write(f"✅ Found {len(ms_sections)} answer section(s) in MS PDF")
+        is_structured = (mode == "Structured Mark Scheme Mode")
+
+        # ── 4) Mark Scheme: branch by mode ───────────────────────────────────
+        if is_structured:
+            st.write("📐 Structured MS mode — locating worked solutions in MS PDF…")
+            try:
+                ms_struct_sections = find_ms_question_locations(ms_bytes)
+            except Exception as e:
+                st.error(f"Structured MS extraction failed: {e}")
+                st.stop()
+            st.write(
+                f"✅ Found {len(ms_struct_sections)} MS section(s) with "
+                f"{sum(len(s['questions']) for s in ms_struct_sections)} "
+                "worked solutions total"
+            )
+            ms_sections = ms_struct_sections   # use shape compatible w/ rest
+        else:
+            st.write("🔑 MCQ mode — extracting answer letters from MS PDF…")
+            try:
+                ms_sections = extract_answers_pymupdf_per_section(ms_bytes)
+            except Exception as e:
+                st.error(f"MS extraction failed: {e}")
+                st.stop()
+            st.write(f"✅ Found {len(ms_sections)} answer section(s) in MS PDF")
 
         # Detect Excel paper segments: a new segment starts whenever Q#
         # drops back to 1 (or to a value much lower than the running max).
-        # Each segment is a list of row INDICES in xl_rows.
         segments: list[list[int]] = []
         current_seg: list[int] = []
         max_qn = 0
         for i, r in enumerate(xl_rows):
             qn = r["qn"]
-            # New segment if Q# resets to 1 OR drops significantly
             if current_seg and (qn == 1 or (max_qn >= 10 and qn < max_qn - 5)):
                 segments.append(current_seg)
                 current_seg = []
@@ -1506,8 +1731,7 @@ if st.button(
         if current_seg:
             segments.append(current_seg)
 
-        st.write(f"📚 Detected {len(segments)} paper segment(s) in Excel "
-                 f"(by Q# restart pattern)")
+        st.write(f"📚 Detected {len(segments)} paper segment(s) in Excel")
 
         # Build row_idx → ms_section mapping by segment order
         row_to_section: dict[int, dict | None] = {}
@@ -1532,19 +1756,41 @@ if st.button(
             n = r["qn"]
             sec = row_to_section.get(i)
             sec_idx = row_to_section_idx.get(i, -1)
-            ans = (sec["answers"].get(str(n), "") if sec else "")
-            ans_ok = ans in ("A", "B", "C", "D")
             found_q   = bool(qp_q) and qp_q.get("found") is not False
-            needs_img = found_q and qp_q.get("needs_image", False)
+            # In Structured mode (Math, etc.) we always crop QP as image
+            # because equations / diagrams / fractions can't be reliably
+            # rendered as plain text.
+            if is_structured:
+                needs_img = found_q
+            else:
+                needs_img = found_q and qp_q.get("needs_image", False)
 
             sec_label = (f"MS section {sec_idx+1}"
-                         + (f" (pp.{sec['start_page']}–{sec['end_page']})"
+                         + (f" (pp.{sec.get('start_page','?')}–"
+                            f"{sec.get('end_page','?')})"
                             if sec else "")) if sec_idx >= 0 else "no section"
+
+            if is_structured:
+                # Structured: crop a per-question image from MS
+                q_info = (sec["questions"].get(n) if sec and "questions" in sec
+                          else None)
+                ms_img = (crop_ms_question_image(ms_bytes, q_info)
+                          if q_info else None)
+                ans_ok = ms_img is not None
+                ans_text = "" if ans_ok else "Answer not found - needs review"
+            else:
+                # MCQ: extract a single letter
+                ans = (sec["answers"].get(str(n), "") if sec else "")
+                ans_ok = ans in ("A", "B", "C", "D")
+                ans_text = ans if ans_ok else "Answer not found - needs review"
+                ms_img = None
 
             questions.append({
                 **r,
                 "_loc":        qp_q.get("_loc"),
                 "_ms_section": sec_label,
+                "_ms_image":   ms_img,           # only set in Structured mode
+                "_mode":       mode,
                 "found":       found_q,
                 "needs_image": needs_img,
                 "text":        qp_q.get("text", "")  if found_q else "",
@@ -1552,7 +1798,7 @@ if st.button(
                 "B":           qp_q.get("B", "")     if found_q else "",
                 "C":           qp_q.get("C", "")     if found_q else "",
                 "D":           qp_q.get("D", "")     if found_q else "",
-                "answer":      ans if ans_ok else "Answer not found - needs review",
+                "answer":      ans_text,
                 "answerFound": ans_ok,
             })
 
@@ -1577,16 +1823,22 @@ if st.button(
             "Q#":         q["qn"],
             "Reference":  q.get("ref", ""),
             "Page":       q.get("page_num", ""),
+            "Mode":       "MCQ" if "MCQ" in (q.get("_mode") or "") else "Structured",
             "MS Section": q.get("_ms_section", ""),
             "Chapter":    q.get("topic", ""),
             "Difficulty": q.get("difficulty", ""),
             "Marks":      q.get("marks", ""),
-            "Type":       "🖼 Image" if q["needs_image"] else "📝 Text",
+            "QP Type":    "🖼 Image" if q["needs_image"] else "📝 Text",
+            "MS Type":    ("🖼 Image" if q.get("_ms_image")
+                            else "🔤 Letter" if q["answerFound"]
+                            else "—"),
             "First line of extracted":
                 (q.get("text", "")[:60] + "…") if q.get("text") and len(q.get("text", "")) > 60
                 else (q.get("text", "") or ("[image — see crop]" if q["needs_image"]
                       else "[not found]")),
-            "Answer":     q["answer"] if q["answerFound"] else "—",
+            "Answer":     (q["answer"] if q["answerFound"] and not q.get("_ms_image")
+                           else ("[image — see Word]" if q.get("_ms_image")
+                                 else "—")),
             "Status":     ("✅" if q["found"] and q["answerFound"]
                            else ("⚠ MS missing" if q["found"]
                                  else ("⚠ QP missing" if q["answerFound"]
