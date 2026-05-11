@@ -250,7 +250,9 @@ def find_question_locations(pdf_bytes: bytes) -> dict:
     result = {}
     for i, (qn, page_idx, top_y, ph, pw, mrx) in enumerate(raw):
         # bottom_y = next marker on SAME page, else page bottom
-        bottom_y = ph * 0.94
+        # IB papers have a footer (page number + copyright) around y=0.92.
+        # We cap bottom_y at 0.88 to definitively exclude the footer.
+        bottom_y = ph * 0.88
         for j in range(i + 1, len(raw)):
             nq, np_idx, ntop, _, _, _ = raw[j]
             if np_idx == page_idx:
