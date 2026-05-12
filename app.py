@@ -2482,129 +2482,39 @@ if st.button(
 
         st.write(f"📚 Using {len(segments)} paper segment(s) for MS matching")
 
-        # ── Build row_idx → ms_section mapping ───────────────────────────────
-        # RULE: QP section i ↔ MS section i (same ordinal position).
-        # We derive the ordinal index via: QP page → known QP code →
-        # known MS page range → find which detected MS section sits on
-        # those pages. This is purely positional — topic is never used
-        # to choose or override a section assignment.
-        _STATIC_QP_TO_MS = {
-            '2221-7209': (1,17),  '2221-7214': (18,33),
-            '8821-7204': (34,50), '2222-7209': (51,66),
-            '2222-7214': (67,85), '8822-7204': (86,100),
-            '2223-7209': (101,124),'2223-7214': (125,144),
-            '8823-7209': (145,158),'8823-7214': (159,172),
-            '2224-7204': (173,188),'2224-7209': (189,204),
-            '8824-7204': (205,218),'2225-7309': (219,236),
-            '2225-7314': (237,256),'2225-7319': (257,275),
-            '8825-7309': (276,290),'8825-7319': (291,306),
-        }
-        _QP_RANGE_LIST = [
-            (1,19,'2221-7209'),(21,40,'2221-7214'),(41,64,'8821-7204'),
-            (65,80,'2222-7209'),(81,102,'2222-7214'),(103,120,'8822-7204'),
-            (124,143,'2223-7209'),(145,163,'2223-7214'),
-            (166,185,'8823-7209'),(186,205,'8823-7214'),
-            (208,231,'2224-7204'),(233,248,'2224-7209'),
-            (250,265,'8824-7204'),(267,290,'2225-7309'),
-            (292,311,'2225-7314'),(313,339,'2225-7319'),
-            (342,368,'8825-7309'),(370,389,'8825-7319'),
-        ]
-        def _pg_to_qp_code(pg):
-            for s,e,c in _QP_RANGE_LIST:
-                if s<=pg<=e: return c
-            return None
-        def _find_ms_sec_for_range(ms1, ms2, secs):
-            for idx,sec in enumerate(secs):
-                pgs = [v["page_idx"]+1 for v in sec["questions"].values()]
-                if not pgs: continue
-                mn,mx = min(pgs),max(pgs)
-                if ms1<=mn<=ms2 or ms1<=mx<=ms2:
-                    return idx, sec
-            return -1, None
-
+        # ── Build row_idx → ms_section mapping: PURE POSITIONAL ────────────
+        # Rule: QP paper i ↔ MS paper i (same ordinal position).
+        # Algorithm:
+        #   1. Sort Excel segments by their minimum QP page number (ascending).
+        #   2. MS sections are already ordered by start_page from detection.
+        #   3. Pair by index: sorted_segments[i] → ms_sections[i].
+        # No paper code, no topic, no keyword used for matching.
         row_to_section: dict[int, dict | None] = {}
-        row_to_section_idx: dict[int, int] = {}
-        seg_paper_codes = []
-        unpaired_segs = []
+        row_to_section_idx: dict[int, int]     = {}
 
-        for seg_idx, seg_rows in enumerate(segments):
-            # Derive QP code from the first located row's page number
-            qp_code = None
+        def _seg_min_page(seg_rows):
+            pgs = [xl_rows[ri].get("page_num", 0) for ri in seg_rows
+                   if xl_rows[ri].get("page_num", 0) > 0]
+            return min(pgs) if pgs else 999999
+
+        # Sort segments by QP page order
+        sorted_seg_indices = sorted(
+            range(len(segments)),
+            key=lambda i: _seg_min_page(segments[i])
+        )
+        seg_paper_codes = [None] * len(segments)   # kept for diagnostic table
+
+        for pos, seg_idx in enumerate(sorted_seg_indices):
+            seg_rows = segments[seg_idx]
+            sec     = ms_sections[pos] if pos < len(ms_sections) else None
+            ms_idx  = pos              if pos < len(ms_sections) else -1
             for ri in seg_rows:
-                pg = xl_rows[ri].get("page_num", 0)
-                if pg:
-                    qp_code = _pg_to_qp_code(pg)
-                    if qp_code: break
-            seg_paper_codes.append(qp_code)
-
-            ms_idx, sec = -1, None
-            if is_structured and qp_code and qp_code in _STATIC_QP_TO_MS:
-                ms1, ms2 = _STATIC_QP_TO_MS[qp_code]
-                ms_idx, sec = _find_ms_sec_for_range(ms1, ms2, ms_sections)
-
-            if sec is not None:
-                for ri in seg_rows:
-                    row_to_section[ri] = sec
-                    row_to_section_idx[ri] = ms_idx
-            else:
-                unpaired_segs.append(seg_idx)
-
-        # Fallback: positional pairing for any unresolved segments
-        claimed_ms_idx = set(row_to_section_idx.values())
-        unclaimed_ms = [i for i in range(len(ms_sections))
-                        if i not in claimed_ms_idx]
-        for unpaired_pos, seg_idx in enumerate(unpaired_segs):
-            ms_idx = unclaimed_ms[unpaired_pos] if unpaired_pos < len(unclaimed_ms) else -1
-            sec    = ms_sections[ms_idx] if ms_idx >= 0 else None
-            for ri in segments[seg_idx]:
-                row_to_section[ri] = sec
+                row_to_section[ri]     = sec
                 row_to_section_idx[ri] = ms_idx
 
-        # ── Per-row override (safety net) ────────────────────────────────────
-        # Some rows end up in segments where qp_code=None → wrong positional
-        # fallback. For every row whose assigned section lacks the row's Q#,
-        # re-derive the correct section directly from the row's page_num.
-        # Also handles Q13/Q12 boundary cases where the static-map range
-        # lookup misses because the last question marker sits at the very
-        # edge of the expected page range.
-        if is_structured:
-            for ri, r in enumerate(xl_rows):
-                qn  = r.get("qn", 0)
-                sec = row_to_section.get(ri)
-                # Skip if already correctly assigned
-                if sec and isinstance(sec, dict) and sec.get("questions", {}).get(qn):
-                    continue
-                # Re-derive from this row's own page_num
-                pg = r.get("page_num", 0)
-                if not pg:
-                    continue
-                code = _pg_to_qp_code(pg)
-                if not code or code not in _STATIC_QP_TO_MS:
-                    continue
-                ms1, ms2 = _STATIC_QP_TO_MS[code]
-                new_idx, new_sec = _find_ms_sec_for_range(ms1, ms2, ms_sections)
-                if new_sec and new_sec.get("questions", {}).get(qn):
-                    row_to_section[ri]     = new_sec
-                    row_to_section_idx[ri] = new_idx
-                    continue
-                # Last resort: scan ALL sections for a section that has
-                # this exact Q# and whose page range overlaps ms1..ms2.
-                # Handles boundary cases where _find_ms_sec_for_range misses.
-                for scan_idx, scan_sec in enumerate(ms_sections):
-                    if not isinstance(scan_sec, dict): continue
-                    if not scan_sec.get("questions", {}).get(qn): continue
-                    sec_pgs = [v["page_idx"]+1
-                               for v in scan_sec["questions"].values()
-                               if isinstance(v, dict)]
-                    if not sec_pgs: continue
-                    sec_min, sec_max = min(sec_pgs), max(sec_pgs)
-                    # Accept if there is any overlap with the expected MS range
-                    if sec_min <= ms2 + 20 and sec_max >= ms1 - 20:
-                        row_to_section[ri]     = scan_sec
-                        row_to_section_idx[ri] = scan_idx
-                        break
+        unpaired_segs = []   # kept for diagnostic count
 
-        # ── Diagnostic: paper / MS section matching table ──────────────────────
+                # ── Diagnostic: paper / MS section matching table ──────────────────────
         # Safe rebuild of ms_code_to_section for diagnostic use only.
         # (The actual matching now uses the static QP-code map above.)
         try:
@@ -2633,8 +2543,7 @@ if st.button(
                 ms_sec   = row_to_section.get(seg_rows[0])
                 ms_code  = (ms_sec.get("paper_code")
                              if isinstance(ms_sec, dict) else None)
-                method   = ("Static-map" if qp_code and qp_code in _STATIC_QP_TO_MS
-                             else "Positional")
+                method   = "Positional"
                 # Reference from first row of segment
                 ref_str  = xl_rows[seg_rows[0]].get("ref", "") if seg_rows else ""
                 match_table.append({
@@ -2912,6 +2821,63 @@ if st.button(
                      if q.get("_topic_match") is False]
     mismatch_pct = (len(mismatch_rows) / max(len(structured_rows), 1)
                     if structured_rows else 0)
+
+    # ── QP vs MS Sanity Check (first 10 questions) ───────────────────────────
+    if is_structured:
+        with st.expander("🔍 QP ↔ MS Sanity Check — first 10 questions", expanded=True):
+            sanity_rows = []
+            try:
+                _doc_qp = fitz.open(stream=qp_bytes, filetype="pdf")
+                _doc_ms = fitz.open(stream=ms_bytes, filetype="pdf")
+
+                def _first_content(doc, pg_idx, skip_pat=None):
+                    if pg_idx is None or pg_idx >= len(doc): return "—"
+                    lines = (doc[pg_idx].get_text() or "").split("\n")
+                    for l in lines:
+                        ls = l.strip()
+                        if len(ls) < 5: continue
+                        if re.match(r"^(Turn over|Answers must|©|–\s*\d|M\d{2}/|N\d{2}/|"
+                                    r"instructions|abbreviation|implied|method of mark)",
+                                    ls, re.I): continue
+                        return ls[:80]
+                    return "—"
+
+                shown = 0
+                for q in questions:
+                    if shown >= 10: break
+                    qp_loc = q.get("_loc")
+                    ms_img = q.get("_ms_image")
+                    # Only include if both QP and MS are resolved
+                    if not qp_loc: continue
+                    qp_snip = _first_content(_doc_qp, qp_loc.get("page_idx"))
+                    # MS page from question's assigned section
+                    sec = row_to_section.get(questions.index(q))
+                    ms_snip = "—"
+                    if sec and isinstance(sec, dict):
+                        qn = q.get("qn", 0)
+                        q_info = sec.get("questions", {}).get(qn)
+                        if q_info:
+                            ms_snip = _first_content(_doc_ms, q_info.get("page_idx"))
+                    sanity_rows.append({
+                        "Q#": shown + 1,
+                        "QP topic (first line)": qp_snip,
+                        "MS answer (first line)": ms_snip,
+                        "MS image": "✅" if ms_img else "⚠️ missing",
+                    })
+                    shown += 1
+
+                _doc_qp.close(); _doc_ms.close()
+            except Exception as _e:
+                st.warning(f"Sanity check could not run: {_e}")
+
+            if sanity_rows:
+                st.dataframe(sanity_rows, use_container_width=True, hide_index=True)
+                st.caption(
+                    "Review QP topic vs MS answer — if they clearly differ "
+                    "(e.g. QP is about trees but MS shows financial app), "
+                    "the section pairing may be wrong. Contact support with the "
+                    "session reference and question number."
+                )
 
     # ── Build & Download ──────────────────────────────────────────────────────
     st.subheader("Download")
