@@ -11,6 +11,7 @@ import json
 import re
 import io
 import base64
+import datetime
 
 import fitz                           # PyMuPDF — PDF inspection + rendering
 from PIL import Image
@@ -117,21 +118,56 @@ def parse_excel(uploaded_file) -> list[dict]:
     uploaded_file.seek(0)
     wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
     ws = wb.active
-    headers = [str(c.value).strip() if c.value else "" for c in next(ws.iter_rows(max_row=1))]
+    raw_headers = [c.value for c in next(ws.iter_rows(max_row=1))]
+    headers = [str(h).strip() if h else "" for h in raw_headers]
+    # Lower-cased + normalised version for fuzzy matching
+    norm_headers = [re.sub(r"[\s_\-\.]+", " ", h.lower()).strip()
+                    for h in headers]
 
-    def col_idx(*names):
-        for n in names:
-            if n in headers:
-                return headers.index(n)
+    def col_idx(*candidates):
+        """Find a column index by trying each candidate name.
+        Match is case-insensitive and ignores spaces/underscores/dots/dashes.
+        """
+        for name in candidates:
+            target = re.sub(r"[\s_\-\.]+", " ", str(name).lower()).strip()
+            for i, h in enumerate(norm_headers):
+                if h == target:
+                    return i
+        # Substring fallback (handles 'PDF Page Number' matching 'Page Number')
+        for name in candidates:
+            target = re.sub(r"[\s_\-\.]+", " ", str(name).lower()).strip()
+            for i, h in enumerate(norm_headers):
+                if target in h or h in target:
+                    return i
         return None
 
-    qn_idx   = col_idx("Question No.", "Question No", "Q No", "Q#", "Question Number", "Q") or 2
-    page_idx = col_idx("Page Number", "Page", "page_number")
-    top_idx  = col_idx("Topic", "Chapter", "topic", "chapter")
-    dif_idx  = col_idx("Difficulty", "difficulty")
-    mrk_idx  = col_idx("Marks", "marks")
-    qut_idx  = col_idx("Quote", "quote")
-    ref_idx  = col_idx("Reference", "ref")
+    qn_idx   = col_idx("Question No.", "Question No", "Q No", "Q#",
+                       "Question Number", "Q", "QuestionNumber")
+    page_idx = col_idx("Page Number", "Page", "page_number",
+                       "PDF Page", "PDF Page Number", "pdf_page",
+                       "QP Page", "Page No.", "Page No", "PageNum")
+    top_idx  = col_idx("Topic", "Chapter", "Section", "Sub-topic", "Subtopic")
+    dif_idx  = col_idx("Difficulty", "Level", "Hardness")
+    mrk_idx  = col_idx("Marks", "Mark", "Points", "Score")
+    qut_idx  = col_idx("Quote", "Note", "Motivational quote")
+    ref_idx  = col_idx("Reference", "Ref", "Session", "Year", "Paper",
+                       "Exam Session", "Paper Reference")
+
+    # Diagnostics — stash on the function so the UI can show them
+    parse_excel.last_headers = headers
+    parse_excel.last_column_map = {
+        "Question No.": (qn_idx,  headers[qn_idx]   if qn_idx   is not None else None),
+        "Page Number":  (page_idx, headers[page_idx] if page_idx is not None else None),
+        "Topic":        (top_idx,  headers[top_idx]  if top_idx  is not None else None),
+        "Difficulty":   (dif_idx,  headers[dif_idx]  if dif_idx  is not None else None),
+        "Marks":        (mrk_idx,  headers[mrk_idx]  if mrk_idx  is not None else None),
+        "Reference":    (ref_idx,  headers[ref_idx]  if ref_idx  is not None else None),
+        "Quote":        (qut_idx,  headers[qut_idx]  if qut_idx  is not None else None),
+    }
+
+    # Fall back to fixed-position 2 only if NOTHING matched (very old format)
+    if qn_idx is None:
+        qn_idx = 2
 
     def cell_val(row, idx, fallback=""):
         if idx is None:
@@ -144,7 +180,7 @@ def parse_excel(uploaded_file) -> list[dict]:
 
     rows = []
     seen_keys = set()
-    duplicates = []   # (qn, reference) pairs that were skipped
+    duplicates = []
 
     for row in ws.iter_rows(min_row=2):
         try:
@@ -165,10 +201,41 @@ def parse_excel(uploaded_file) -> list[dict]:
         if marks <= 0:
             marks = 1
 
-        try:
-            page_num = int(float(cell_val(row, page_idx, "0")))
-        except ValueError:
-            page_num = 0
+        # Page number — handle:
+        #   - integers:   91
+        #   - strings:    "91", "p.91", "Page 91"
+        #   - ranges:     "82-83", "p.82-83"  → take first number
+        #   - datetimes:  Excel auto-converts "2-3" → 2026-02-03 → BAD!
+        #                 We try to recover from .number_format or skip.
+        raw_page = ""
+        if page_idx is not None:
+            try:
+                cell = list(row)[page_idx]
+                v = cell.value
+                if v is None:
+                    raw_page = ""
+                elif isinstance(v, datetime.datetime):
+                    # Excel converted "X-Y" → date. Try to recover X and Y
+                    # from the month and day.
+                    raw_page = f"{v.month}-{v.day}"
+                else:
+                    raw_page = str(v).strip()
+            except (IndexError, AttributeError):
+                raw_page = ""
+
+        page_num = 0
+        if raw_page:
+            # Find first integer in the string (handles "82-83" → 82,
+            # "p.91" → 91, "Page 91 (left)" → 91)
+            m = re.search(r"\d+", raw_page)
+            if m:
+                try:
+                    candidate = int(m.group())
+                    # Reject obviously-wrong values (Excel YYYY conversions)
+                    if 1 <= candidate <= 9999:
+                        page_num = candidate
+                except ValueError:
+                    page_num = 0
 
         difficulty = cell_val(row, dif_idx, "Unspecified") or "Unspecified"
         ref        = cell_val(row, ref_idx, "")
@@ -288,6 +355,18 @@ def find_question_locations(pdf_bytes: bytes) -> dict:
     # Bare page-number pattern (only counts as footer in bottom strip)
     bare_num_pat = re.compile(r"^\s*\d{1,3}\s*$")
 
+    # IB QP "writing lines" — dotted answer-box lines. The PDF contains
+    # text like ". . . . . . . . . . . . . . . . . . . ." for each blank line.
+    # We must NOT include these in the question crop (the worksheet has its
+    # own Student's Solution box). A line counts as a writing line when ≥ 80%
+    # of its non-space chars are dots.
+    def is_writing_line(txt: str) -> bool:
+        s = (txt or "").replace(" ", "").replace("\t", "")
+        if len(s) < 8:
+            return False
+        dots = s.count(".")
+        return dots / max(len(s), 1) >= 0.8
+
     for pi in range(len(doc2)):
         page = doc2[pi]
         ph = page.rect.height
@@ -325,12 +404,28 @@ def find_question_locations(pdf_bytes: bytes) -> dict:
                 first_footer_y0 = min(first_footer_y0, y0)
                 break
 
-        # Now find the last content line above that boundary
-        content_bottom = 0   # will accumulate max y1 of content lines
+        # Find the FIRST writing line — the answer-box dotted lines.
+        # Everything below this is the answer box and must be excluded
+        # from the question crop. Writing lines can appear above 0.5 too
+        # (short questions on a half-page), so we don't restrict by y here.
+        first_writing_y0 = None
+        for y0, y1, txt in sorted(lines_info, key=lambda t: t[0]):
+            if is_writing_line(txt):
+                first_writing_y0 = y0
+                break
+
+        # Effective cutoff: the earlier of (footer top, writing-line top)
+        upper_bound = first_footer_y0
+        if first_writing_y0 is not None and first_writing_y0 < upper_bound:
+            upper_bound = first_writing_y0
+
+        # Now find the last content line above that boundary.
+        # Writing lines and footers are NOT content.
+        content_bottom = 0
         for y0, y1, txt in lines_info:
-            if is_footer(y0, txt):
+            if is_footer(y0, txt) or is_writing_line(txt):
                 continue
-            if y1 < first_footer_y0 - 2:
+            if y1 < upper_bound - 2:
                 if y1 > content_bottom:
                     content_bottom = y1
 
@@ -340,7 +435,7 @@ def find_question_locations(pdf_bytes: bytes) -> dict:
 
         content_bottom_per_page[pi] = min(
             content_bottom + 8,
-            first_footer_y0 - 6,
+            upper_bound - 6,
         )
 
     doc2.close()
@@ -385,7 +480,7 @@ def find_question_for_excel_row(
     locations: dict,           # {(page, qn): {...}}
     q_num: int,
     excel_page: int,
-    tolerance: int = 3,        # tolerate ±N pages of mismatch
+    tolerance: int = 5,        # tolerate ±N pages of mismatch
 ) -> dict | None:
     """Pick the right `locations` entry for an Excel row.
 
@@ -420,6 +515,70 @@ def find_question_for_excel_row(
     return None
 
 
+def find_question_with_segment_offset(
+    locations: dict,
+    q_num: int,
+    excel_page: int,
+    segment_offset: int = 0,
+) -> dict | None:
+    """Like find_question_for_excel_row, but applies a learned per-segment
+    page offset before searching. If excel_page=16 and offset=-4, we look
+    for the question near PDF page 12.
+
+    Falls back to plain matching if offset-based lookup fails.
+    """
+    if excel_page and excel_page > 0:
+        # Try shifted page first
+        shifted = excel_page + segment_offset
+        if shifted > 0:
+            if (shifted, q_num) in locations:
+                return locations[(shifted, q_num)]
+            # Wider tolerance after offset
+            candidates = [
+                (abs(p - shifted), p)
+                for (p, qn) in locations
+                if qn == q_num and abs(p - shifted) <= 5
+            ]
+            if candidates:
+                candidates.sort()
+                _, p = candidates[0]
+                return locations[(p, q_num)]
+
+    # Fall back to plain matching (no offset)
+    return find_question_for_excel_row(locations, q_num, excel_page)
+
+
+def infer_segment_page_offsets(
+    locations: dict,
+    xl_rows: list,
+    segments: list,
+) -> list:
+    """For each Excel paper-segment, infer the offset between Excel page
+    numbers and QP PDF page numbers, by looking at Q1 positions.
+
+    Returns a list of offsets, one per segment.
+    """
+    offsets = []
+    for seg_rows in segments:
+        seg_offset = 0   # default
+        # Find Q1 in this segment
+        q1_rows = [xl_rows[ri] for ri in seg_rows if xl_rows[ri]["qn"] == 1]
+        if q1_rows:
+            excel_q1_page = q1_rows[0]["page_num"]
+            if excel_q1_page > 0:
+                # Find nearest QP Q1 location
+                q1_qp_pages = sorted(p for (p, qn) in locations if qn == 1)
+                if q1_qp_pages:
+                    # Pick the QP Q1 closest to excel_q1_page
+                    nearest = min(q1_qp_pages,
+                                  key=lambda p: abs(p - excel_q1_page))
+                    # Only use offset if within reason (< 20 pages off)
+                    if abs(nearest - excel_q1_page) < 20:
+                        seg_offset = nearest - excel_q1_page
+        offsets.append(seg_offset)
+    return offsets
+
+
 def crop_question_png(pdf_bytes: bytes, loc: dict, q_num: int = None,
                       dpi: int = 200) -> bytes | None:
     """Crop the question area from the QP PDF and return PNG bytes.
@@ -445,7 +604,12 @@ def crop_question_png(pdf_bytes: bytes, loc: dict, q_num: int = None,
     # appear inside the embedded image — it's already in the heading.
     mrx = loc.get("marker_right_x", 0)
     left_px = max(0, int((mrx + 6) * scale)) if mrx else 0
-    right_px = iw
+    # Trim the right margin — IB papers have:
+    #   - a vertical page-border line around x ≈ 0.93 × page_width
+    #   - sometimes a writing/notes column inside that border
+    # Cropping at 0.92 × page_width removes the border but keeps "[2]" marks.
+    pw = loc.get("page_width", 0) or (iw / scale)
+    right_px = iw - int(pw * 0.05 * scale)
 
     if bottom_px <= top_px or right_px <= left_px:
         return None
@@ -974,10 +1138,23 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     except Exception:
         return []
 
-    # Step 1: scan every page for "N." markers near the left margin
-    # MS markers can be "1." alone OR "1.   Solve 2x..." at start of line
-    pat = re.compile(r"^(\d+)\.\s*")
-    raw_markers = []   # (qn, page_idx, top_y, page_height)
+    # Step 1: scan every page for "N." question markers.
+    # Math MS markers in IB format are typically "N." on a line by themselves
+    # at the LEFT margin (often x0 < 50). The number is followed by either:
+    #   - end of line (just "N.")
+    #   - or a space then question content (rare in MS — the (a)/(b) parts
+    #     live on the next line)
+    # We REJECT lines like "1.9 and..." or "1.5 20" because the digit after
+    # the dot means it's a decimal, not a marker.
+    raw_markers = []   # (qn, page_idx, top_y, page_height, marker_right_x)
+    # Markers can be:
+    #   "1."  (most common)
+    #   "1. (a)"  (when question content starts on same line)
+    #   "1"   alone in bold (no dot — some Math MS use this style)
+    pat_strict = re.compile(r"^(\d{1,2})\.\s*$")
+    pat_qa     = re.compile(r"^(\d{1,2})\.\s+\(?\w")
+    pat_nodot  = re.compile(r"^(\d{1,2})\s*$")     # bare "1", "2", "10"
+
     for pi in range(len(doc)):
         page = doc[pi]
         ph = page.rect.height
@@ -989,19 +1166,37 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
                 spans = line.get("spans", [])
                 if not spans:
                     continue
-                # Combine all span text on this line (sometimes "1." and
-                # "Solve…" are separate spans)
-                full_line = "".join(s.get("text", "") for s in spans)
+                full_line = "".join(s.get("text", "") for s in spans).strip()
                 bb = line["bbox"]
-                m = pat.match(full_line)
-                if not m:
+                if bb[0] > 80:   # MS question markers sit at the far left
                     continue
-                if bb[0] > 120:   # not left-margin marker
+
+                qn = None
+                m = pat_strict.match(full_line) or pat_qa.match(full_line)
+                if m:
+                    qn = int(m.group(1))
+                else:
+                    # Try bare "1", "2", … but ONLY if it's bold AND sits at
+                    # the very left margin (x0 < 50pt). Instructions pages
+                    # also have bold "1", "2" but indented further right.
+                    m2 = pat_nodot.match(full_line)
+                    if m2 and bb[0] < 50:
+                        font = spans[0].get("font", "")
+                        size = spans[0].get("size", 0)
+                        # Bold AND reasonable body-text size (10-13pt)
+                        if ("Bold" in font or "bold" in font) and 9 <= size <= 14:
+                            qn = int(m2.group(1))
+
+                if qn is None:
                     continue
-                qn = int(m.group(1))
-                if qn < 1 or qn > 99:
+                if qn < 1 or qn > 30:
                     continue
-                raw_markers.append((qn, pi, bb[1], ph))
+                # Reject decimal numbers ("1.5", "1.9")
+                if re.match(rf"^{qn}\.\d", full_line):
+                    continue
+                # Marker right edge for cropping
+                marker_right_x = spans[0]["bbox"][2] if spans else (bb[0] + 20)
+                raw_markers.append((qn, pi, bb[1], ph, marker_right_x))
 
     doc.close()
 
@@ -1013,7 +1208,7 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     current: dict = {"questions": {}, "_order": [],
                      "start_page": raw_markers[0][1] + 1, "max_qn": 0}
 
-    for qn, pi, top_y, ph in raw_markers:
+    for qn, pi, top_y, ph, mrx in raw_markers:
         # New section if qn repeats OR resets to 1 after Q ≥ 5
         if (qn in current["questions"] or
                 (qn == 1 and current["max_qn"] >= 5)):
@@ -1023,12 +1218,13 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
                            "start_page": pi + 1, "max_qn": 0}
 
         current["questions"][qn] = {
-            "page_idx":     pi,
-            "top_y":        top_y,
-            "bottom_y":     ph * 0.92,   # tentative — refined below
-            "end_page_idx": pi,
-            "end_y":        ph * 0.92,
-            "page_height":  ph,
+            "page_idx":       pi,
+            "top_y":          top_y,
+            "bottom_y":       ph * 0.92,   # tentative — refined below
+            "end_page_idx":   pi,
+            "end_y":          ph * 0.92,
+            "page_height":    ph,
+            "marker_right_x": mrx,
         }
         current["_order"].append((qn, pi, top_y))
         if qn > current["max_qn"]:
@@ -1061,7 +1257,89 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
         # Remove internal _order key
         sec.pop("_order", None)
 
+    # Filter out tiny "sections" (< 5 questions). These are typically
+    # table-of-contents / index pages, not real worked-solution pages.
+    sections = [s for s in sections if len(s["questions"]) >= 5]
+
+    # Also filter out sections that sit inside instructions/cover pages.
+    # IB MS PDFs have ~5 pages of "Instructions to Examiners", "Abbreviations",
+    # "Marks awarded for...", etc., which contain numbered lists that look
+    # like question markers. We detect this by checking the page text.
+    instr_pat = re.compile(
+        r"(instructions to examiners|abbreviations|marks? awarded for|"
+        r"using the markscheme|method of marking|implied marks|"
+        r"misread|brackets in working)",
+        re.IGNORECASE
+    )
+    try:
+        doc2 = fitz.open(stream=ms_bytes, filetype="pdf")
+        filtered = []
+        for s in sections:
+            start = s["start_page"] - 1
+            # Look at the section's first 1-2 pages
+            instr_score = 0
+            for pi in range(start, min(start + 2, len(doc2))):
+                txt = doc2[pi].get_text()
+                if instr_pat.search(txt):
+                    instr_score += 1
+            if instr_score == 0:
+                filtered.append(s)
+        doc2.close()
+        sections = filtered
+    except Exception:
+        pass
+
     return sections
+
+
+def _topic_keywords(text: str) -> set:
+    """Extract distinctive content words from text, ignoring boilerplate.
+    Used to compare QP question topic vs MS answer topic — if the keyword
+    overlap is too small, the MS is for a different question."""
+    if not text:
+        return set()
+    # Normalise: lowercase, strip math markers, keep letters/digits
+    t = text.lower()
+    # Remove IB boilerplate that appears in every question
+    boilerplate = re.compile(
+        r"(maximum\s+mark|marks?\s*\]|"
+        r"answers?\s+must\s+be|working\s+and/?or|"
+        r"international\s+baccalaureate|"
+        r"©\s*\d{4}|turn\s+over|"
+        r"award\s+(a\d|m\d|r\d)|note\s*:|"
+        r"\b(m\d|a\d|r\d|ft|ag)\b|"
+        r"calculator|gdc|gradient|substitute|"
+        r"\bsolve\b|\bfind\b|\bcalculate\b|\bdetermine\b|\bgiven\b|\bshow\b|"
+        r"\bvalue\b|\bvalues\b|\bequation\b|\bexpression\b|\banswer\b|"
+        r"\bcorrect\b|\bworking\b|\busing\b|\bfollowing\b|"
+        r"\bthe\b|\bof\b|\ba\b|\bto\b|\bin\b|\bis\b|\bfor\b|\bbe\b|"
+        r"\bby\b|\bwith\b|\bare\b|\band\b|\bor\b|\bif\b|\bnot\b|\bcan\b|"
+        r"\bone\b|\btwo\b|\bthree\b|\bfour\b|\bfive\b|\bsix\b|\bseven\b|"
+        r"\beight\b|\bnine\b|\bten\b|"
+        r"\bmark\b|\bmarks\b|\bpart\b|\bparts\b|\bpoint\b|\bpoints\b)",
+        re.IGNORECASE
+    )
+    t = boilerplate.sub(" ", t)
+    # Extract alphabetic tokens of length ≥ 4 (skip short noise)
+    tokens = re.findall(r"\b[a-z][a-z]{3,}\b", t)
+    return set(tokens)
+
+
+def _topics_match(qp_text: str, ms_text: str, threshold: float = 0.10) -> bool:
+    """Return True if QP question and MS answer share enough topic-keywords
+    to plausibly be about the same question. Used as a safety check before
+    embedding an MS image, to catch wrong-paper pairings."""
+    qp_kw = _topic_keywords(qp_text)
+    ms_kw = _topic_keywords(ms_text)
+    if not qp_kw or not ms_kw:
+        return True   # can't tell — give benefit of doubt
+    overlap = qp_kw & ms_kw
+    # Match ratio over the smaller set
+    smaller = min(len(qp_kw), len(ms_kw))
+    if smaller == 0:
+        return True
+    ratio = len(overlap) / smaller
+    return ratio >= threshold
 
 
 def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
@@ -1070,6 +1348,13 @@ def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
 
     The question may span multiple pages. We render each spanned page,
     stack them vertically into one tall image, and return PNG bytes.
+
+    Crop rules (per page slice):
+      - Top:      a few px above the question marker
+      - Bottom:   just above the next question / footer
+      - Left:     trims the page's left margin (~5% in)
+      - Right:    trims the page's right margin (~5% in)
+    Headers (top 5%) and footers (below 92%) are always excluded.
     """
     if not q_info:
         return None
@@ -1078,6 +1363,7 @@ def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
     end_pi   = q_info.get("end_page_idx", start_pi)
     start_y  = q_info["top_y"]
     end_y    = q_info["end_y"]
+    mrx      = q_info.get("marker_right_x", 0)   # right edge of "N." marker
 
     try:
         doc = fitz.open(stream=ms_bytes, filetype="pdf")
@@ -1087,36 +1373,160 @@ def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
     scale = dpi / 72
     pieces = []
 
+    # Footer detectors. Strong patterns (always footer): IB exam codes,
+    # copyright. Weak pattern (bare numbers) is only treated as footer
+    # when the line is in the very bottom strip (y > 0.93 × ph), so that
+    # equation subscripts like "u₁ = -6, d = 2" aren't mistaken for page
+    # numbers when they appear mid-page.
+    ms_strong_footer = re.compile(
+        r"(M\d{2}/\d/|N\d{2}/\d/|"
+        r"international\s+baccalaureate|"
+        r"©\s*\d{4})",
+        re.IGNORECASE
+    )
+    ms_bare_num = re.compile(r"^\s*\d{1,3}\s*$")
+
+    def is_ms_footer(text: str, y0: float, ph_: float) -> bool:
+        if ms_strong_footer.search(text):
+            return True
+        if ms_bare_num.match(text) and y0 > ph_ * 0.93:
+            return True
+        return False
+
+    def find_ms_footer_top(page) -> float:
+        """Return the y0 of the first footer line in lower half of page."""
+        ph_ = page.rect.height
+        td = page.get_text("dict")
+        first_y = ph_ * 0.95
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                text = "".join(s.get("text", "") for s in spans).strip()
+                if not text:
+                    continue
+                bb = line["bbox"]
+                if bb[1] < ph_ * 0.85:
+                    continue
+                if is_ms_footer(text, bb[1], ph_):
+                    if bb[1] < first_y:
+                        first_y = bb[1]
+        return first_y
+
+    def find_header_bottom(page) -> float:
+        """Return the y1 of the page-header block (page number / exam code
+        at the top of the page). Anything above this is junk."""
+        ph_ = page.rect.height
+        td = page.get_text("dict")
+        header_y1 = 0
+        header_pat = re.compile(
+            r"(^\s*[–\-]\s*\d{1,3}\s*[–\-]\s*$|"   # "– 9 –"
+            r"M\d{2}/\d/|N\d{2}/\d/)",
+            re.IGNORECASE
+        )
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                text = "".join(s.get("text", "") for s in spans).strip()
+                if not text:
+                    continue
+                bb = line["bbox"]
+                if bb[1] > ph_ * 0.12:
+                    continue
+                if header_pat.search(text):
+                    if bb[3] > header_y1:
+                        header_y1 = bb[3]
+        return header_y1
+
+    def find_last_content_y(page, top_y: float, hard_bottom: float) -> float:
+        """Return the y1 of the LAST real content line between top_y and
+        hard_bottom on this page."""
+        ph_ = page.rect.height
+        td = page.get_text("dict")
+        last_y1 = top_y
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                text = "".join(s.get("text", "") for s in spans).strip()
+                if not text:
+                    continue
+                bb = line["bbox"]
+                if bb[1] < top_y - 2:
+                    continue
+                if bb[1] >= hard_bottom - 2:
+                    continue
+                if is_ms_footer(text, bb[1], ph_):
+                    continue
+                if bb[3] > last_y1:
+                    last_y1 = bb[3]
+        return last_y1
+
     for pi in range(start_pi, end_pi + 1):
         if pi >= len(doc):
             break
         page = doc[pi]
         ph = page.rect.height
+        pw = page.rect.width
         mat = fitz.Matrix(scale, scale)
         pix = page.get_pixmap(matrix=mat, alpha=False)
         full = Image.open(io.BytesIO(pix.tobytes("png")))
         iw, ih = full.size
 
-        if pi == start_pi and pi == end_pi:
-            # Single-page question
-            top_px = max(0,  int(start_y * scale) - 10)
-            bot_px = min(ih, int(end_y   * scale) + 5)
-        elif pi == start_pi:
-            # First page of multi-page question
-            top_px = max(0,  int(start_y * scale) - 10)
-            bot_px = min(ih, int(ph * 0.92 * scale))   # to footer
-        elif pi == end_pi:
-            # Last page of multi-page question
-            top_px = int(ph * 0.05 * scale)   # skip header
-            bot_px = min(ih, int(end_y * scale) + 5)
-        else:
-            # Middle page — keep entire content area
-            top_px = int(ph * 0.05 * scale)
-            bot_px = int(ph * 0.92 * scale)
+        # Detect this page's footer top (page number / exam code)
+        footer_top = find_ms_footer_top(page)
+        page_bottom_y = max(ph * 0.5, footer_top - 6)
 
-        if bot_px <= top_px:
+        # Horizontal trim
+        right_px = iw - int(pw * 0.06 * scale)
+
+        if pi == start_pi and mrx:
+            left_px = max(0, int((mrx + 6) * scale))
+        else:
+            left_px = int(pw * 0.04 * scale)
+
+        # Detect this page's header bottom (page number + exam code at top)
+        header_bottom = find_header_bottom(page)
+        page_top_y = max(ph * 0.06, header_bottom + 6) if header_bottom else ph * 0.06
+
+        # Determine vertical bounds per page, tight to actual content
+        if pi == start_pi and pi == end_pi:
+            # Single-page question: known end_y from next-marker detection
+            top_y_pi = start_y
+            bot_y_pi = min(end_y, page_bottom_y)
+        elif pi == start_pi:
+            # First page of multi-page: trim to the last real content line on
+            # this page (no big empty area before page break)
+            top_y_pi = start_y
+            bot_y_pi = find_last_content_y(page, start_y, page_bottom_y)
+            bot_y_pi = min(bot_y_pi + 6, page_bottom_y)
+        elif pi == end_pi:
+            # Last page: start below the page header
+            top_y_pi = page_top_y
+            actual_end = find_last_content_y(page, top_y_pi, min(end_y, page_bottom_y))
+            bot_y_pi = min(actual_end + 6, end_y, page_bottom_y)
+        else:
+            # Middle page: from below header to last real content
+            top_y_pi = page_top_y
+            bot_y_pi = find_last_content_y(page, top_y_pi, page_bottom_y)
+            bot_y_pi = min(bot_y_pi + 6, page_bottom_y)
+
+        top_px = max(0,  int(top_y_pi * scale) - 6)
+        bot_px = min(ih, int(bot_y_pi * scale) + 4)
+
+        if bot_px <= top_px or right_px <= left_px:
             continue
-        pieces.append(full.crop((0, top_px, iw, bot_px)))
+        pieces.append(full.crop((left_px, top_px, right_px, bot_px)))
 
     doc.close()
 
@@ -1357,9 +1767,33 @@ def build_word_document(
         section.right_margin  = Cm(2.0)
 
     # ── Group by Topic → Difficulty ───────────────────────────────────────────
+    # First, normalize chapter names so visual differences don't fragment groups:
+    #   "Chapter 1 : Number & Algebra"  →  "1. Number & Algebra"
+    #   "Chapter 1: Number & Algebra"   →  "1. Number & Algebra"
+    #   " 1.  Number & Algebra "        →  "1. Number & Algebra"
+    def _normalize_topic(t: str) -> str:
+        if not t or str(t).strip().lower() in ("error", "none", "nan", ""):
+            return "Unclassified"
+        s = str(t).strip()
+        # "Chapter N : Foo" or "Chapter N: Foo" → "N. Foo"
+        m = re.match(r"^\s*chapter\s+(\d+)\s*[:\.\-–]?\s*(.+?)\s*$",
+                     s, re.IGNORECASE)
+        if m:
+            return f"{m.group(1)}. {m.group(2).strip()}"
+        # "N : Foo" / "N: Foo" / "N. Foo" → "N. Foo"
+        m = re.match(r"^\s*(\d+)\s*[\.:\-–]\s*(.+?)\s*$", s)
+        if m:
+            return f"{m.group(1)}. {m.group(2).strip()}"
+        # Collapse multiple spaces
+        return re.sub(r"\s+", " ", s)
+
+    # Apply normalization in-place so later rendering uses the canonical name
+    for q in questions:
+        q["topic"] = _normalize_topic(q.get("topic"))
+
     grouped: dict[str, dict[str, list]] = {}
     for q in questions:
-        t = q.get("topic") or "Unclassified"
+        t = q["topic"]
         d = q.get("difficulty") or "Unspecified"
         grouped.setdefault(t, {}).setdefault(d, []).append(q)
 
@@ -1586,6 +2020,9 @@ def build_word_document(
                 ap = doc.add_paragraph()
                 ap.paragraph_format.space_before = Pt(8)
                 ap.paragraph_format.space_after  = Pt(2)
+                # Keep the header glued to the answer below — no orphan headers
+                ap.paragraph_format.keep_with_next = True
+                ap.paragraph_format.keep_together = True
                 _run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
                 # Structured mode: MS image (full worked solution) when present
@@ -1594,6 +2031,7 @@ def build_word_document(
                     aip = doc.add_paragraph()
                     aip.paragraph_format.space_before = Pt(0)
                     aip.paragraph_format.space_after  = Pt(2)
+                    aip.paragraph_format.keep_together = True
                     aip.add_run().add_picture(io.BytesIO(ms_img_bytes),
                                               width=Cm(CONTENT_WIDTH_CM - 1.0))
                 else:
@@ -1637,6 +2075,27 @@ if st.button(
     qp_bytes = read_bytes(qp_file)
     ms_bytes = read_bytes(ms_file)
 
+    # ── Safety check: did the user accidentally upload the same file twice? ─
+    if qp_bytes == ms_bytes:
+        st.error(
+            "❌ **The QP and MS files are identical!**\n\n"
+            "You uploaded the same PDF in both the Question Paper and Mark "
+            "Scheme slots. The worksheet would show the QP question in the "
+            "'Answer from Mark Scheme' section — which is wrong.\n\n"
+            "Please upload the actual **Mark Scheme PDF** (different from the "
+            "QP) in the MS slot and try again."
+        )
+        st.stop()
+    # Also catch near-identical files (same size + same first 1KB usually
+    # means same source even after PDF re-export)
+    if (abs(len(qp_bytes) - len(ms_bytes)) < 1024
+            and qp_bytes[:1024] == ms_bytes[:1024]):
+        st.warning(
+            "⚠ The QP and MS files look very similar (same first bytes and "
+            "almost identical size).  Are you sure you uploaded the correct "
+            "Mark Scheme?  Continuing anyway, but the output may be wrong."
+        )
+
     with st.status("Processing…", expanded=True) as status:
 
         # ── 1) Excel ─────────────────────────────────────────────────────────
@@ -1652,8 +2111,39 @@ if st.button(
 
         st.write(f"✅ {len(xl_rows)} question rows in Excel")
 
-        # Show only TRUE duplicate removals (same Q# + same Reference +
-        # same Page + same Topic + same Difficulty)
+        # ── Show how Excel columns were mapped (catches header mismatches) ──
+        col_map = getattr(parse_excel, "last_column_map", {})
+        if col_map:
+            mapped_pairs = []
+            unmapped = []
+            for logical, (idx, actual) in col_map.items():
+                if idx is None:
+                    unmapped.append(logical)
+                else:
+                    mapped_pairs.append(f"**{logical}** → `{actual}`")
+            with st.expander("🔍 Excel column mapping (click to verify)",
+                             expanded=bool(unmapped)):
+                st.write("Detected columns:")
+                st.write(" · ".join(mapped_pairs))
+                if unmapped:
+                    st.error(
+                        f"❌ Missing column(s): {', '.join(unmapped)}.  "
+                        "Rename your Excel headers to one of the accepted "
+                        "aliases (e.g. 'Page Number', 'PDF Page', 'Q#', "
+                        "'Reference', 'Topic', 'Difficulty', 'Marks')."
+                    )
+
+        # Warn if many rows have page_num=0 (column mismatch or missing data)
+        zero_page_count = sum(1 for r in xl_rows if not r.get("page_num"))
+        if zero_page_count > len(xl_rows) * 0.1:   # >10% rows with no page
+            st.warning(
+                f"⚠ {zero_page_count}/{len(xl_rows)} rows have Page Number = 0.  "
+                "This will cause poor matching with the QP. Check that the "
+                "'Page Number' column in your Excel is populated, and that "
+                "the header name is recognised (see column mapping above)."
+            )
+
+        # Show only TRUE duplicate removals
         dups = getattr(parse_excel, "last_duplicates", [])
         if dups:
             st.warning(
@@ -1670,11 +2160,91 @@ if st.button(
             st.stop()
         st.write(f"✅ Found {len(locations)} question marker(s) in QP across all pages")
 
+        # Warn if Excel refers to pages beyond the QP PDF's actual size
+        try:
+            qp_pdf_pages = max(loc["page_idx"] for loc in locations.values()) + 1
+        except (ValueError, KeyError):
+            qp_pdf_pages = 0
+        beyond_qp = [r for r in xl_rows
+                     if r.get("page_num", 0) > qp_pdf_pages]
+        if beyond_qp:
+            sample_refs = sorted({r["ref"] for r in beyond_qp})[:5]
+            st.warning(
+                f"⚠ {len(beyond_qp)} Excel row(s) reference pages **beyond "
+                f"the QP PDF's {qp_pdf_pages} pages**.  Those questions are "
+                "from papers not included in the uploaded QP.\n\n"
+                "Affected reference(s) (sample): "
+                + ", ".join(f"`{r}`" for r in sample_refs)
+                + (" …" if len(beyond_qp) > 5 else "")
+                + "\n\nUpload a QP PDF that contains every paper referenced "
+                "in your Excel — or remove those Excel rows."
+            )
+
+        # ── 2b) Detect Excel paper segments + per-segment page offsets ──────
+        # If Excel page numbers don't line up with QP PDF page numbers
+        # (e.g. Excel comes from a combined PDF with cover pages), we infer
+        # a per-segment offset using each segment's Q1 location.
+        # A new segment starts whenever:
+        #   - the Reference string changes (different exam), OR
+        #   - the Q# resets to 1 (next paper in the same session), OR
+        #   - the Q# drops significantly (e.g. from Q12 back to Q3)
+        excel_segments: list[list[int]] = []
+        cur_seg: list[int] = []
+        seg_max = 0
+        seg_ref = None
+        for i, r in enumerate(xl_rows):
+            qn = r["qn"]
+            ref = r.get("ref", "")
+            new_segment = False
+            if cur_seg:
+                if ref != seg_ref:
+                    new_segment = True
+                elif qn == 1:
+                    new_segment = True
+                elif seg_max >= 10 and qn < seg_max - 5:
+                    new_segment = True
+            if new_segment:
+                excel_segments.append(cur_seg)
+                cur_seg = []
+                seg_max = 0
+            cur_seg.append(i)
+            if qn > seg_max:
+                seg_max = qn
+            seg_ref = ref
+        if cur_seg:
+            excel_segments.append(cur_seg)
+
+        seg_offsets = infer_segment_page_offsets(
+            locations, xl_rows, excel_segments
+        )
+        # Build row → offset lookup
+        row_offset = {}
+        for seg_idx, seg_rows in enumerate(excel_segments):
+            off = seg_offsets[seg_idx] if seg_idx < len(seg_offsets) else 0
+            for ri in seg_rows:
+                row_offset[ri] = off
+
+        nonzero_offsets = [(i+1, o) for i, o in enumerate(seg_offsets) if o != 0]
+        if nonzero_offsets:
+            st.info(
+                f"📐 Detected page offset(s) between Excel and QP PDF: "
+                + ", ".join(f"segment {i} → {o:+d} pages"
+                            for i, o in nonzero_offsets[:5])
+                + (" …" if len(nonzero_offsets) > 5 else "")
+            )
+
         # ── 3) Extract text + classify per-Excel-row using (qn, page) ───────
         # CRITICAL: We pass tuples of (q_num, excel_page) so the extractor can
         # disambiguate when the same Q# appears in multiple papers within one PDF.
         st.write("🔍 Extracting question text per row…")
-        row_tuples = [(r["qn"], r.get("page_num", 0)) for r in xl_rows]
+        # Apply per-segment offset BEFORE handing pages to extractor
+        row_tuples = []
+        for i, r in enumerate(xl_rows):
+            p = r.get("page_num", 0)
+            off = row_offset.get(i, 0)
+            if p and off:
+                p = max(1, p + off)
+            row_tuples.append((r["qn"], p))
         try:
             qp_data = classify_and_extract(
                 None, "", row_tuples,
@@ -1714,24 +2284,11 @@ if st.button(
                 st.stop()
             st.write(f"✅ Found {len(ms_sections)} answer section(s) in MS PDF")
 
-        # Detect Excel paper segments: a new segment starts whenever Q#
-        # drops back to 1 (or to a value much lower than the running max).
-        segments: list[list[int]] = []
-        current_seg: list[int] = []
-        max_qn = 0
-        for i, r in enumerate(xl_rows):
-            qn = r["qn"]
-            if current_seg and (qn == 1 or (max_qn >= 10 and qn < max_qn - 5)):
-                segments.append(current_seg)
-                current_seg = []
-                max_qn = 0
-            current_seg.append(i)
-            if qn > max_qn:
-                max_qn = qn
-        if current_seg:
-            segments.append(current_seg)
+        # Reuse the excel_segments computed earlier (with the same
+        # Reference + Q-restart logic), so QP and MS matching stay aligned.
+        segments = excel_segments
 
-        st.write(f"📚 Detected {len(segments)} paper segment(s) in Excel")
+        st.write(f"📚 Using {len(segments)} paper segment(s) for MS matching")
 
         # Build row_idx → ms_section mapping by segment order
         row_to_section: dict[int, dict | None] = {}
@@ -1743,11 +2300,30 @@ if st.button(
                 row_to_section_idx[ri] = seg_idx
 
         if len(ms_sections) != len(segments):
-            st.warning(
-                f"⚠ Excel has {len(segments)} paper segment(s) but MS PDF "
-                f"yielded {len(ms_sections)} section(s). Some answers may be "
-                "missing or mismatched — review the validation table below."
-            )
+            ratio = len(ms_sections) / max(len(segments), 1)
+            if ratio < 0.5 and is_structured:
+                # MS is missing more than half the papers — answers will be
+                # wrong if we try to pair them. Disable MS image lookup so
+                # every row shows "Answer not found - needs review".
+                st.error(
+                    f"❌ **MS PDF doesn't cover this Excel.** "
+                    f"Excel has {len(segments)} paper segment(s) but the MS "
+                    f"PDF only contains {len(ms_sections)} section(s).\n\n"
+                    "Pairing them in order would produce **wrong answers** "
+                    "(e.g. Q1 from May 2024 paired with Q1 from May 2021). "
+                    "Upload an MS PDF that contains every paper your Excel "
+                    "references, or filter Excel to match the MS you have.\n\n"
+                    "Continuing with empty MS so you can still review QP "
+                    "matching — but answers will be marked 'not found'."
+                )
+                # Disable MS assignment entirely
+                row_to_section = {ri: None for ri in row_to_section}
+            else:
+                st.warning(
+                    f"⚠ Excel has {len(segments)} paper segment(s) but MS PDF "
+                    f"yielded {len(ms_sections)} section(s). Some answers may be "
+                    "missing or mismatched — review the validation table below."
+                )
 
         # ── 5) Merge — every Excel row gets its own per-row extraction ──────
         st.write("🔗 Merging per row…")
@@ -1774,22 +2350,68 @@ if st.button(
                 # Structured: crop a per-question image from MS
                 q_info = (sec["questions"].get(n) if sec and "questions" in sec
                           else None)
-                ms_img = (crop_ms_question_image(ms_bytes, q_info)
-                          if q_info else None)
+                ms_img = None
+                ms_page_used = (q_info["page_idx"] + 1) if q_info else None
+                ms_first_line = ""
+                topic_match = True
+
+                if q_info:
+                    # Extract MS page text to check it actually answers this Q
+                    try:
+                        _doc = fitz.open(stream=ms_bytes, filetype="pdf")
+                        ms_page_text = _doc[q_info["page_idx"]].get_text()
+                        # Use Excel question text from the row + Excel topic
+                        # as the QP-side "what this question is about"
+                        qp_text_for_check = (r.get("text_qp", "") + " "
+                                              + r.get("topic", "") + " "
+                                              + (r.get("quote", "") or ""))
+                        # The Excel row may have a 'text' or similar column —
+                        # fall back to QP page text if too short.
+                        if len(qp_text_for_check.strip()) < 30 and qp_q.get("_loc"):
+                            qp_page_text = _doc.close()
+                            _doc2 = fitz.open(stream=qp_bytes, filetype="pdf")
+                            qp_text_for_check = _doc2[qp_q["_loc"]["page_idx"]].get_text()
+                            _doc2.close()
+                            _doc = fitz.open(stream=ms_bytes, filetype="pdf")
+                        topic_match = _topics_match(qp_text_for_check, ms_page_text)
+                        # Capture first non-trivial MS line for validation table
+                        for ln in ms_page_text.split("\n"):
+                            ln = ln.strip()
+                            if len(ln) > 5 and not re.match(r"^[\-–\d\s/]+$", ln):
+                                ms_first_line = ln[:80]
+                                break
+                        _doc.close()
+                    except Exception:
+                        topic_match = True   # don't block on errors
+
+                    if topic_match:
+                        ms_img = crop_ms_question_image(ms_bytes, q_info)
+
                 ans_ok = ms_img is not None
-                ans_text = "" if ans_ok else "Answer not found - needs review"
+                if ans_ok:
+                    ans_text = ""
+                elif q_info and not topic_match:
+                    ans_text = "MS answer mismatch - needs review"
+                else:
+                    ans_text = "Answer not found - needs review"
             else:
                 # MCQ: extract a single letter
                 ans = (sec["answers"].get(str(n), "") if sec else "")
                 ans_ok = ans in ("A", "B", "C", "D")
                 ans_text = ans if ans_ok else "Answer not found - needs review"
                 ms_img = None
+                ms_page_used = sec.get("start_page") if sec else None
 
             questions.append({
                 **r,
                 "_loc":        qp_q.get("_loc"),
                 "_ms_section": sec_label,
                 "_ms_image":   ms_img,           # only set in Structured mode
+                "_ms_page":    ms_page_used,     # which MS PDF page was used
+                "_ms_first":   ms_first_line if is_structured else "",
+                "_topic_match": topic_match if is_structured else True,
+                "_qp_page":    (qp_q["_loc"]["page_idx"] + 1
+                                 if qp_q.get("_loc") else None),
                 "_mode":       mode,
                 "found":       found_q,
                 "needs_image": needs_img,
@@ -1822,7 +2444,9 @@ if st.button(
             "Excel Row":  i + 2,
             "Q#":         q["qn"],
             "Reference":  q.get("ref", ""),
-            "Page":       q.get("page_num", ""),
+            "Excel Page": q.get("page_num", ""),
+            "QP Page Used": q.get("_qp_page") or "—",
+            "MS Page Used": q.get("_ms_page") or "—",
             "Mode":       "MCQ" if "MCQ" in (q.get("_mode") or "") else "Structured",
             "MS Section": q.get("_ms_section", ""),
             "Chapter":    q.get("topic", ""),
@@ -1832,10 +2456,13 @@ if st.button(
             "MS Type":    ("🖼 Image" if q.get("_ms_image")
                             else "🔤 Letter" if q["answerFound"]
                             else "—"),
+            "Topic Match": ("✅" if q.get("_topic_match", True)
+                            else "❌ MISMATCH"),
             "First line of extracted":
                 (q.get("text", "")[:60] + "…") if q.get("text") and len(q.get("text", "")) > 60
                 else (q.get("text", "") or ("[image — see crop]" if q["needs_image"]
                       else "[not found]")),
+            "First line of MS":   q.get("_ms_first", "")[:60],
             "Answer":     (q["answer"] if q["answerFound"] and not q.get("_ms_image")
                            else ("[image — see Word]" if q.get("_ms_image")
                                  else "—")),
@@ -1848,8 +2475,97 @@ if st.button(
         hide_index=True,
     )
 
+    # ── Unmatched rows table (problems that block a clean download) ──────────
+    unmatched = []
+    for i, q in enumerate(questions):
+        problems = []
+        if not q["found"]:
+            if not q.get("page_num"):
+                problems.append("no Page Number in Excel")
+            else:
+                problems.append(
+                    f"Q{q['qn']} not located on page {q['page_num']} of QP"
+                )
+        if not q["answerFound"]:
+            if q.get("_ms_image") is None and "Structured" in (q.get("_mode") or ""):
+                problems.append(f"Q{q['qn']} not found in MS section")
+            elif "MCQ" in (q.get("_mode") or ""):
+                problems.append(f"Q{q['qn']} has no A/B/C/D answer in MS")
+        if problems:
+            unmatched.append({
+                "Excel Row":      i + 2,
+                "Reference":      q.get("ref", ""),
+                "Q#":             q["qn"],
+                "Page (Excel)":   q.get("page_num", 0),
+                "Reason":         " · ".join(problems),
+            })
+
+    qp_match_pct = found_qp / max(total, 1)
+    if unmatched:
+        st.subheader(f"⚠ Unmatched rows ({len(unmatched)})")
+        st.dataframe(unmatched, use_container_width=True, hide_index=True)
+
+    # Gate the download when QP matching is clearly broken
+    BAD_MATCH_THRESHOLD = 0.70    # need ≥ 70% rows located in QP
+    matching_is_bad = qp_match_pct < BAD_MATCH_THRESHOLD
+
+    # Also count topic-mismatches in Structured mode
+    structured_rows = [q for q in questions
+                       if "Structured" in (q.get("_mode") or "")
+                       and q.get("_ms_page")]
+    mismatch_rows = [q for q in structured_rows
+                     if q.get("_topic_match") is False]
+    mismatch_pct = (len(mismatch_rows) / max(len(structured_rows), 1)
+                    if structured_rows else 0)
+
     # ── Build & Download ──────────────────────────────────────────────────────
     st.subheader("Download")
+
+    if matching_is_bad:
+        st.error(
+            f"❌ Cannot generate worksheet: only {found_qp}/{total} "
+            f"({qp_match_pct:.0%}) of rows were located in the QP PDF. "
+            "Fix the matching before downloading."
+        )
+        st.info(
+            "Most likely causes:\n"
+            "- The QP PDF doesn't contain the papers your Excel rows refer "
+            "to (e.g. Excel mixes Paper 1 + Paper 2 but only Paper 1 was "
+            "uploaded). Look at **Unmatched rows** for which references "
+            "are affected.\n"
+            "- Excel **Page Number** column has wrong values or "
+            "auto-converted dates. Review the **Excel column mapping** "
+            "expander.\n"
+            "- Wrong **Mode** selected for this subject."
+        )
+        st.stop()
+
+    if mismatch_pct > 0.30 and len(structured_rows) >= 5:
+        st.error(
+            f"❌ **MS answers don't match the questions.** "
+            f"{len(mismatch_rows)}/{len(structured_rows)} rows show topic "
+            f"mismatch — the MS PDF you uploaded is for a **different "
+            f"paper/subject** than the QP.\n\n"
+            "Common cause: Math **SL** QP paired with Math **HL** MS, "
+            "or vice versa.  The questions are different papers even though "
+            "the year/session matches.\n\n"
+            "Upload an MS PDF that corresponds to **the same paper "
+            "(level + paper number) as the QP**, then re-run."
+        )
+        st.info(
+            "Review the **Topic Match** column in the validation table — "
+            "rows marked ❌ MISMATCH have an MS image whose first line is "
+            "about a different topic than the question."
+        )
+        st.stop()
+    elif qp_match_pct < 0.95:
+        st.warning(
+            f"⚠ {found_qp}/{total} rows matched ({qp_match_pct:.0%}). "
+            f"{total - found_qp} unmatched rows will show "
+            "'Question not found' in the worksheet. Review the **Unmatched "
+            "rows** table above before downloading."
+        )
+
     if visual_cnt:
         st.info(
             f"ℹ️ {visual_cnt} questions contain visual content — actual images "
@@ -1879,6 +2595,6 @@ if st.button(
     st.download_button(
         label="⬇️ Download Worksheet (.docx)",
         data=docx_bytes,
-        file_name="IB_Chemistry_Worksheet.docx",
+        file_name="IB_Worksheet.docx",
         mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     )
