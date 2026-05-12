@@ -1916,6 +1916,8 @@ def build_word_document(
         if not t or str(t).strip().lower() in ("error", "none", "nan", ""):
             return "Unclassified"
         s = str(t).strip()
+        # Strip leading # markers
+        s = re.sub(r'^#+\s*', '', s).strip()
         # "Chapter N : Foo" or "Chapter N: Foo" → "N. Foo"
         m = re.match(r"^\s*chapter\s+(\d+)\s*[:\.\-–]?\s*(.+?)\s*$",
                      s, re.IGNORECASE)
@@ -2095,6 +2097,11 @@ def build_word_document(
                     vis = True
 
                 # ── Body: image OR text ────────────────────────────────────────
+                # Structured mode always uses image crop — never plain text —
+                # so questions with equations/diagrams are always clear.
+                if is_structured and found and not vis:
+                    vis = True   # force image for every found structured Q
+
                 if not found:
                     np_ = doc.add_paragraph()
                     _run(np_, "Question not found on specified page - needs review",
@@ -2199,10 +2206,22 @@ def build_word_document(
                             width=Cm(CONTENT_WIDTH_CM - 1.0)
                         )
                 else:
+                    # No MS image available
                     av = doc.add_paragraph()
                     av.paragraph_format.space_before = Pt(0)
                     av.paragraph_format.space_after  = Pt(2)
-                    _run(av, answer, bold=True, size_pt=12)
+                    if is_structured:
+                        # Structured mode: always prefer image; if missing,
+                        # show the Excel answer text (or a review notice).
+                        ms_txt = str(answer or "").strip()
+                        if ms_txt and ms_txt not in ("nan", "Answer not found - needs review"):
+                            _run(av, ms_txt, size_pt=11)
+                        else:
+                            _run(av,
+                                 "⚠ Mark Scheme image not available for this question — needs review",
+                                 italic=True, size_pt=11)
+                    else:
+                        _run(av, answer, bold=True, size_pt=12)
 
                 # ── Separator before Keep it up ────────────────────────────────
                 _hr(doc, color="BFBFBF")
@@ -2463,11 +2482,12 @@ if st.button(
 
         st.write(f"📚 Using {len(segments)} paper segment(s) for MS matching")
 
-        # ── Build row_idx → ms_section mapping via STATIC QP-code map ─────────
-        # Positional matching fails when the MS PDF sections are not in the
-        # same order as the QP segments. The static map below encodes the
-        # known QP-page-range → MS-page-range relationship for IB Math AI SL
-        # combined PDFs, giving reliable code-based matching for all 18 papers.
+        # ── Build row_idx → ms_section mapping ───────────────────────────────
+        # RULE: QP section i ↔ MS section i (same ordinal position).
+        # We derive the ordinal index via: QP page → known QP code →
+        # known MS page range → find which detected MS section sits on
+        # those pages. This is purely positional — topic is never used
+        # to choose or override a section assignment.
         _STATIC_QP_TO_MS = {
             '2221-7209': (1,17),  '2221-7214': (18,33),
             '8821-7204': (34,50), '2222-7209': (51,66),
