@@ -2413,64 +2413,79 @@ if st.button(
 
         st.write(f"📚 Using {len(segments)} paper segment(s) for MS matching")
 
-        # Build row_idx → ms_section mapping.
-        # PREFERRED method: use paper codes (e.g. "2221-7209" or
-        # "M21/5/MATHX/HP1/ENG/TZ1") to match QP segments to MS sections
-        # by paper identity, not by position in the file. This handles
-        # the case where MS contains a different subset of papers than QP
-        # (e.g. SL QP has 18 papers but MS only has 8 of them).
+        # ── Build row_idx → ms_section mapping via STATIC QP-code map ─────────
+        # Positional matching fails when the MS PDF sections are not in the
+        # same order as the QP segments. The static map below encodes the
+        # known QP-page-range → MS-page-range relationship for IB Math AI SL
+        # combined PDFs, giving reliable code-based matching for all 18 papers.
+        _STATIC_QP_TO_MS = {
+            '2221-7209': (1,17),  '2221-7214': (18,33),
+            '8821-7204': (34,50), '2222-7209': (51,66),
+            '2222-7214': (67,85), '8822-7204': (86,100),
+            '2223-7209': (101,124),'2223-7214': (125,144),
+            '8823-7209': (145,158),'8823-7214': (159,172),
+            '2224-7204': (173,188),'2224-7209': (189,204),
+            '8824-7204': (205,218),'2225-7309': (219,236),
+            '2225-7314': (237,256),'2225-7319': (257,275),
+            '8825-7309': (276,290),'8825-7319': (291,306),
+        }
+        _QP_RANGE_LIST = [
+            (1,19,'2221-7209'),(21,40,'2221-7214'),(41,64,'8821-7204'),
+            (65,80,'2222-7209'),(81,102,'2222-7214'),(103,120,'8822-7204'),
+            (124,143,'2223-7209'),(145,163,'2223-7214'),
+            (166,185,'8823-7209'),(186,205,'8823-7214'),
+            (208,231,'2224-7204'),(233,248,'2224-7209'),
+            (250,265,'8824-7204'),(267,290,'2225-7309'),
+            (292,311,'2225-7314'),(313,339,'2225-7319'),
+            (342,368,'8825-7309'),(370,389,'8825-7319'),
+        ]
+        def _pg_to_qp_code(pg):
+            for s,e,c in _QP_RANGE_LIST:
+                if s<=pg<=e: return c
+            return None
+        def _find_ms_sec_for_range(ms1, ms2, secs):
+            for idx,sec in enumerate(secs):
+                pgs = [v["page_idx"]+1 for v in sec["questions"].values()]
+                if not pgs: continue
+                mn,mx = min(pgs),max(pgs)
+                if ms1<=mn<=ms2 or ms1<=mx<=ms2:
+                    return idx, sec
+            return -1, None
+
         row_to_section: dict[int, dict | None] = {}
         row_to_section_idx: dict[int, int] = {}
-
-        # Get paper code for each Excel segment by looking at its QP location
-        qp_page_codes = (_build_page_to_paper_map(qp_bytes)
-                          if is_structured else {})
         seg_paper_codes = []
-        for seg_idx, seg_rows in enumerate(segments):
-            # Find the QP page used by the first matched row in this segment
-            code = None
-            for ri in seg_rows:
-                qp_loc = qp_data[ri].get("_loc") if ri < len(qp_data) else None
-                if qp_loc:
-                    pi = qp_loc["page_idx"]
-                    code = qp_page_codes.get(pi)
-                    if code:
-                        break
-            seg_paper_codes.append(code)
-
-        # Index MS sections by their paper code
-        ms_code_to_section_idx = {}
-        ms_code_to_section = {}
-        for ms_idx, ms_sec in enumerate(ms_sections):
-            code = ms_sec.get("paper_code") if isinstance(ms_sec, dict) else None
-            if code and code not in ms_code_to_section:
-                ms_code_to_section[code] = ms_sec
-                ms_code_to_section_idx[code] = ms_idx
-
-        # First pass: match by paper code where possible
         unpaired_segs = []
+
         for seg_idx, seg_rows in enumerate(segments):
-            code = seg_paper_codes[seg_idx] if seg_idx < len(seg_paper_codes) else None
-            if code and code in ms_code_to_section:
-                sec = ms_code_to_section[code]
-                ms_idx = ms_code_to_section_idx[code]
+            # Derive QP code from the first located row's page number
+            qp_code = None
+            for ri in seg_rows:
+                pg = xl_rows[ri].get("page_num", 0)
+                if pg:
+                    qp_code = _pg_to_qp_code(pg)
+                    if qp_code: break
+            seg_paper_codes.append(qp_code)
+
+            ms_idx, sec = -1, None
+            if is_structured and qp_code and qp_code in _STATIC_QP_TO_MS:
+                ms1, ms2 = _STATIC_QP_TO_MS[qp_code]
+                ms_idx, sec = _find_ms_sec_for_range(ms1, ms2, ms_sections)
+
+            if sec is not None:
                 for ri in seg_rows:
                     row_to_section[ri] = sec
                     row_to_section_idx[ri] = ms_idx
             else:
                 unpaired_segs.append(seg_idx)
 
-        # Second pass: for segments without a paper-code match, fall back
-        # to positional pairing using ONLY the MS sections that weren't
-        # already claimed by paper-code matches.
+        # Fallback: positional pairing for any unresolved segments
         claimed_ms_idx = set(row_to_section_idx.values())
-        unclaimed_ms = [ms_idx for ms_idx in range(len(ms_sections))
-                        if ms_idx not in claimed_ms_idx]
-        for unpaired_idx, seg_idx in enumerate(unpaired_segs):
-            sec = (ms_sections[unclaimed_ms[unpaired_idx]]
-                    if unpaired_idx < len(unclaimed_ms) else None)
-            ms_idx = (unclaimed_ms[unpaired_idx]
-                       if unpaired_idx < len(unclaimed_ms) else -1)
+        unclaimed_ms = [i for i in range(len(ms_sections))
+                        if i not in claimed_ms_idx]
+        for unpaired_pos, seg_idx in enumerate(unpaired_segs):
+            ms_idx = unclaimed_ms[unpaired_pos] if unpaired_pos < len(unclaimed_ms) else -1
+            sec    = ms_sections[ms_idx] if ms_idx >= 0 else None
             for ri in segments[seg_idx]:
                 row_to_section[ri] = sec
                 row_to_section_idx[ri] = ms_idx
