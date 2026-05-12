@@ -1114,6 +1114,65 @@ def extract_answers_pymupdf(ms_bytes: bytes) -> dict:
 # ───────────────────────────────────────────────────────────────────────────────
 #  STRUCTURED MARK SCHEME (Math / Bio with worked solutions)
 # ───────────────────────────────────────────────────────────────────────────────
+def _detect_paper_code(text: str) -> str | None:
+    """Pull a normalised paper code from a chunk of PDF text.
+
+    IB papers carry one of two code formats:
+      - "2221 – 7209"  →  numeric (year+month + paper#-tz)
+      - "M21/5/MATHX/HP1/ENG/TZ1/XX"  →  alphanumeric
+    We normalise both to a common form like "M21/HP1/TZ1" so a QP and MS
+    for the same paper match even when they carry different code styles.
+    Returns the normalised code or None.
+    """
+    if not text:
+        return None
+
+    # IB alphanumeric: "M21/5/MATHX/HP1/ENG/TZ1"
+    m = re.search(r'([MN])(\d{2})/\d/MATH\w+/([HS])P(\d)/\w+/(TZ\d|TZ0)', text)
+    if m:
+        session, year, level, paper, tz = m.groups()
+        return f"{session}{year}/{level}P{paper}/{tz}"
+
+    # Numeric: "2221-7209".
+    # IB convention (for Math Analysis & Approaches and AI):
+    #   first 4 digits = YYSS where YY = year, SS = session marker
+    #     - 22 → May 2021 paper-set (the year is YY+1 — see note)
+    #     Actually the rule is: "2221" means 2021 May (subject-paper-year),
+    #     where "22" is the math-subject code and "21" the year.
+    # The last 4 digits are paper-level-TZ:
+    #   71XX = HL Paper 1, 72XX = SL/AI Paper 1, etc.
+    # Since the mapping isn't trivially recoverable, we keep both code
+    # styles and rely on the user uploading a matching pair (so QP code
+    # set ⊆ MS code set for at least some sessions, or vice versa).
+    m = re.search(r'\b(\d{4})\s*[\-–]\s*(\d{4})\b', text)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}"
+
+    return None
+
+
+def _build_page_to_paper_map(pdf_bytes: bytes) -> dict:
+    """For every page in the PDF, identify its paper code. Returns
+    {page_idx: paper_code_string}. Pages without a detectable code keep
+    the code from the previous page (so cover/instruction pages of a
+    paper still get tagged)."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception:
+        return {}
+    page_to_code = {}
+    last_code = None
+    for pi in range(len(doc)):
+        text = doc[pi].get_text()
+        code = _detect_paper_code(text)
+        if code:
+            last_code = code
+        if last_code:
+            page_to_code[pi] = last_code
+    doc.close()
+    return page_to_code
+
+
 def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     """For structured MS (e.g. Math): find every question's bounding box
     across all pages of the MS PDF.
@@ -1288,6 +1347,13 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
         sections = filtered
     except Exception:
         pass
+
+    # Tag each section with the paper code on its first page (used to match
+    # the right MS section for each Excel paper segment).
+    page_codes = _build_page_to_paper_map(ms_bytes)
+    for s in sections:
+        first_page_idx = s["start_page"] - 1
+        s["paper_code"] = page_codes.get(first_page_idx)
 
     return sections
 
@@ -2290,14 +2356,102 @@ if st.button(
 
         st.write(f"📚 Using {len(segments)} paper segment(s) for MS matching")
 
-        # Build row_idx → ms_section mapping by segment order
+        # Build row_idx → ms_section mapping.
+        # PREFERRED method: use paper codes (e.g. "2221-7209" or
+        # "M21/5/MATHX/HP1/ENG/TZ1") to match QP segments to MS sections
+        # by paper identity, not by position in the file. This handles
+        # the case where MS contains a different subset of papers than QP
+        # (e.g. SL QP has 18 papers but MS only has 8 of them).
         row_to_section: dict[int, dict | None] = {}
         row_to_section_idx: dict[int, int] = {}
+
+        # Get paper code for each Excel segment by looking at its QP location
+        qp_page_codes = (_build_page_to_paper_map(qp_bytes)
+                          if is_structured else {})
+        seg_paper_codes = []
         for seg_idx, seg_rows in enumerate(segments):
-            sec = ms_sections[seg_idx] if seg_idx < len(ms_sections) else None
+            # Find the QP page used by the first matched row in this segment
+            code = None
             for ri in seg_rows:
+                qp_loc = qp_data[ri].get("_loc") if ri < len(qp_data) else None
+                if qp_loc:
+                    pi = qp_loc["page_idx"]
+                    code = qp_page_codes.get(pi)
+                    if code:
+                        break
+            seg_paper_codes.append(code)
+
+        # Index MS sections by their paper code
+        ms_code_to_section_idx = {}
+        ms_code_to_section = {}
+        for ms_idx, ms_sec in enumerate(ms_sections):
+            code = ms_sec.get("paper_code") if isinstance(ms_sec, dict) else None
+            if code and code not in ms_code_to_section:
+                ms_code_to_section[code] = ms_sec
+                ms_code_to_section_idx[code] = ms_idx
+
+        # First pass: match by paper code where possible
+        unpaired_segs = []
+        for seg_idx, seg_rows in enumerate(segments):
+            code = seg_paper_codes[seg_idx] if seg_idx < len(seg_paper_codes) else None
+            if code and code in ms_code_to_section:
+                sec = ms_code_to_section[code]
+                ms_idx = ms_code_to_section_idx[code]
+                for ri in seg_rows:
+                    row_to_section[ri] = sec
+                    row_to_section_idx[ri] = ms_idx
+            else:
+                unpaired_segs.append(seg_idx)
+
+        # Second pass: for segments without a paper-code match, fall back
+        # to positional pairing using ONLY the MS sections that weren't
+        # already claimed by paper-code matches.
+        claimed_ms_idx = set(row_to_section_idx.values())
+        unclaimed_ms = [ms_idx for ms_idx in range(len(ms_sections))
+                        if ms_idx not in claimed_ms_idx]
+        for unpaired_idx, seg_idx in enumerate(unpaired_segs):
+            sec = (ms_sections[unclaimed_ms[unpaired_idx]]
+                    if unpaired_idx < len(unclaimed_ms) else None)
+            ms_idx = (unclaimed_ms[unpaired_idx]
+                       if unpaired_idx < len(unclaimed_ms) else -1)
+            for ri in segments[seg_idx]:
                 row_to_section[ri] = sec
-                row_to_section_idx[ri] = seg_idx
+                row_to_section_idx[ri] = ms_idx
+
+        # Diagnostic
+        paired_by_code = sum(1 for code in seg_paper_codes
+                              if code and code in ms_code_to_section)
+        if is_structured:
+            qp_codes_set = set(c for c in seg_paper_codes if c)
+            ms_codes_set = set(s.get("paper_code") for s in ms_sections
+                                if s.get("paper_code"))
+            overlap = qp_codes_set & ms_codes_set
+            if paired_by_code > 0:
+                st.info(
+                    f"📋 Matched {paired_by_code}/{len(segments)} Excel paper "
+                    f"segments to MS sections by paper code.  The remaining "
+                    f"{len(unpaired_segs)} segment(s) fall back to positional "
+                    "pairing (validated per-row by topic match)."
+                )
+            elif qp_codes_set and ms_codes_set and not overlap:
+                # QP and MS use different code formats OR cover different
+                # papers entirely. Show the codes so the user can verify.
+                qp_sample = sorted(qp_codes_set)[:3]
+                ms_sample = sorted(ms_codes_set)[:3]
+                st.warning(
+                    f"⚠ **QP and MS paper codes don't overlap.** "
+                    f"This means either:\n"
+                    f"- The two files use different code styles (numeric "
+                    f"vs alphanumeric), in which case the app will fall "
+                    f"back to positional pairing + per-row topic match.\n"
+                    f"- Or they're for different subjects/levels (e.g. "
+                    f"SL QP with HL MS), in which case answers will not "
+                    f"match the questions.\n\n"
+                    f"Sample QP codes: `{qp_sample}`\n\n"
+                    f"Sample MS codes: `{ms_sample}`\n\n"
+                    "Make sure both files are for the **same subject and "
+                    "level** (e.g. both Math AI SL, or both Math AA HL)."
+                )
 
         if len(ms_sections) != len(segments):
             ratio = len(ms_sections) / max(len(segments), 1)
