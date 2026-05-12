@@ -2491,8 +2491,24 @@ if st.button(
                 row_to_section_idx[ri] = ms_idx
 
         # ── Diagnostic: paper / MS section matching table ──────────────────────
-        paired_by_code = sum(1 for code in seg_paper_codes
-                              if code and code in ms_code_to_section)
+        # Safe rebuild of ms_code_to_section for diagnostic use only.
+        # (The actual matching now uses the static QP-code map above.)
+        try:
+            ms_code_to_section = {}
+            for _ms_i, _ms_sec in enumerate(ms_sections):
+                _code = (_ms_sec.get("paper_code")
+                         if isinstance(_ms_sec, dict) else None)
+                if _code and _code not in ms_code_to_section:
+                    ms_code_to_section[_code] = _ms_i
+        except Exception:
+            ms_code_to_section = {}
+
+        try:
+            paired_by_code = sum(1 for code in seg_paper_codes
+                                  if code and code in ms_code_to_section)
+        except Exception:
+            paired_by_code = 0
+
         if is_structured:
             # Build per-segment matching table
             match_table = []
@@ -2501,8 +2517,9 @@ if st.button(
                              if seg_idx < len(seg_paper_codes) else None)
                 ms_sec_i = row_to_section_idx.get(seg_rows[0], -1)
                 ms_sec   = row_to_section.get(seg_rows[0])
-                ms_code  = (ms_sec.get("paper_code") if ms_sec else None)
-                method   = ("Code match" if qp_code and qp_code in ms_code_to_section
+                ms_code  = (ms_sec.get("paper_code")
+                             if isinstance(ms_sec, dict) else None)
+                method   = ("Static-map" if qp_code and qp_code in _STATIC_QP_TO_MS
                              else "Positional")
                 # Reference from first row of segment
                 ref_str  = xl_rows[seg_rows[0]].get("ref", "") if seg_rows else ""
