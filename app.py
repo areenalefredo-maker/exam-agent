@@ -2475,40 +2475,46 @@ if st.button(
                 row_to_section[ri] = sec
                 row_to_section_idx[ri] = ms_idx
 
-        # Diagnostic
+        # ── Diagnostic: paper / MS section matching table ──────────────────────
         paired_by_code = sum(1 for code in seg_paper_codes
                               if code and code in ms_code_to_section)
         if is_structured:
-            qp_codes_set = set(c for c in seg_paper_codes if c)
-            ms_codes_set = set(s.get("paper_code") for s in ms_sections
-                                if s.get("paper_code"))
-            overlap = qp_codes_set & ms_codes_set
-            if paired_by_code > 0:
-                st.info(
-                    f"📋 Matched {paired_by_code}/{len(segments)} Excel paper "
-                    f"segments to MS sections by paper code.  The remaining "
-                    f"{len(unpaired_segs)} segment(s) fall back to positional "
-                    "pairing (validated per-row by topic match)."
-                )
-            elif qp_codes_set and ms_codes_set and not overlap:
-                # QP and MS use different code formats OR cover different
-                # papers entirely. Show the codes so the user can verify.
-                qp_sample = sorted(qp_codes_set)[:3]
-                ms_sample = sorted(ms_codes_set)[:3]
-                st.warning(
-                    f"⚠ **QP and MS paper codes don't overlap.** "
-                    f"This means either:\n"
-                    f"- The two files use different code styles (numeric "
-                    f"vs alphanumeric), in which case the app will fall "
-                    f"back to positional pairing + per-row topic match.\n"
-                    f"- Or they're for different subjects/levels (e.g. "
-                    f"SL QP with HL MS), in which case answers will not "
-                    f"match the questions.\n\n"
-                    f"Sample QP codes: `{qp_sample}`\n\n"
-                    f"Sample MS codes: `{ms_sample}`\n\n"
-                    "Make sure both files are for the **same subject and "
-                    "level** (e.g. both Math AI SL, or both Math AA HL)."
-                )
+            # Build per-segment matching table
+            match_table = []
+            for seg_idx, seg_rows in enumerate(segments):
+                qp_code  = (seg_paper_codes[seg_idx]
+                             if seg_idx < len(seg_paper_codes) else None)
+                ms_sec_i = row_to_section_idx.get(seg_rows[0], -1)
+                ms_sec   = row_to_section.get(seg_rows[0])
+                ms_code  = (ms_sec.get("paper_code") if ms_sec else None)
+                method   = ("Code match" if qp_code and qp_code in ms_code_to_section
+                             else "Positional")
+                # Reference from first row of segment
+                ref_str  = xl_rows[seg_rows[0]].get("ref", "") if seg_rows else ""
+                match_table.append({
+                    "Seg#":          seg_idx + 1,
+                    "Excel Ref":     ref_str[:40],
+                    "QP code":       qp_code or "—",
+                    "MS section#":   ms_sec_i + 1 if ms_sec_i >= 0 else "—",
+                    "MS code":       ms_code or "—",
+                    "Method":        method,
+                    "Questions":     len(seg_rows),
+                    "MS Qs avail":   len(ms_sec.get("questions", {})) if ms_sec else 0,
+                })
+            with st.expander(
+                f"📋 Paper ↔ MS Section Matching  "
+                f"({paired_by_code} by code, "
+                f"{len(unpaired_segs)} positional)",
+                expanded=True,
+            ):
+                st.dataframe(match_table, use_container_width=True, hide_index=True)
+                if paired_by_code == 0:
+                    st.info(
+                        "ℹ️ QP and MS use different code formats "
+                        "(numeric vs alphanumeric). "
+                        "All segments matched by position — this is normal "
+                        "when QP and MS come from the same combined PDF."
+                    )
 
         if len(ms_sections) != len(segments):
             ratio = len(ms_sections) / max(len(segments), 1)
@@ -2591,42 +2597,50 @@ if st.button(
                 topic_match = True
 
                 if q_info:
-                    # Extract MS page text to check it actually answers this Q
+                    # FIX: Always use actual QP page text for topic check —
+                    # the Excel topic string ("Chapter 1…") has zero overlap
+                    # with MS keywords, causing 197 false mismatches.
                     try:
                         _doc = fitz.open(stream=ms_bytes, filetype="pdf")
                         ms_page_text = _doc[q_info["page_idx"]].get_text()
-                        # Use Excel question text from the row + Excel topic
-                        # as the QP-side "what this question is about"
-                        qp_text_for_check = (r.get("text_qp", "") + " "
-                                              + r.get("topic", "") + " "
-                                              + (r.get("quote", "") or ""))
-                        # The Excel row may have a 'text' or similar column —
-                        # fall back to QP page text if too short.
-                        if len(qp_text_for_check.strip()) < 30 and qp_q.get("_loc"):
-                            qp_page_text = _doc.close()
-                            _doc2 = fitz.open(stream=qp_bytes, filetype="pdf")
-                            qp_text_for_check = _doc2[qp_q["_loc"]["page_idx"]].get_text()
-                            _doc2.close()
-                            _doc = fitz.open(stream=ms_bytes, filetype="pdf")
+                        _doc.close()
+
+                        # Always prefer real QP page text for topic comparison
+                        qp_text_for_check = ""
+                        if qp_q.get("_loc"):
+                            try:
+                                _doc2 = fitz.open(stream=qp_bytes, filetype="pdf")
+                                qp_text_for_check = _doc2[qp_q["_loc"]["page_idx"]].get_text()
+                                _doc2.close()
+                            except Exception:
+                                pass
+                        # Last resort: Excel topic + quote
+                        if not qp_text_for_check.strip():
+                            qp_text_for_check = (r.get("topic", "") + " "
+                                                  + (r.get("quote", "") or ""))
+
                         topic_match = _topics_match(qp_text_for_check, ms_page_text)
+
                         # Capture first non-trivial MS line for validation table
                         for ln in ms_page_text.split("\n"):
                             ln = ln.strip()
                             if len(ln) > 5 and not re.match(r"^[\-–\d\s/]+$", ln):
                                 ms_first_line = ln[:80]
                                 break
-                        _doc.close()
                     except Exception:
                         topic_match = True   # don't block on errors
 
-                    if topic_match:
-                        ms_img = crop_ms_question_image(ms_bytes, q_info)
+                    # FIX: topic_match is a WARNING only — not a blocker.
+                    # Requirement: "Topic يستخدم كتحذير فقط"
+                    # Always crop the MS image when q_info is found.
+                    ms_img = crop_ms_question_image(ms_bytes, q_info)
 
                 ans_ok = ms_img is not None
                 if ans_ok:
                     ans_text = ""
                 elif q_info and not topic_match:
-                    ans_text = "MS answer mismatch - needs review"
+                    # Topic mismatch recorded for display — image still attempted
+                    ans_text = "Answer not found - needs review"
                 else:
                     ans_text = "Answer not found - needs review"
             else:
