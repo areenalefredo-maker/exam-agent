@@ -2302,23 +2302,20 @@ if st.button(
         if len(ms_sections) != len(segments):
             ratio = len(ms_sections) / max(len(segments), 1)
             if ratio < 0.5 and is_structured:
-                # MS is missing more than half the papers — answers will be
-                # wrong if we try to pair them. Disable MS image lookup so
-                # every row shows "Answer not found - needs review".
-                st.error(
-                    f"❌ **MS PDF doesn't cover this Excel.** "
+                st.warning(
+                    f"⚠ **MS PDF covers fewer papers than Excel needs.** "
                     f"Excel has {len(segments)} paper segment(s) but the MS "
                     f"PDF only contains {len(ms_sections)} section(s).\n\n"
-                    "Pairing them in order would produce **wrong answers** "
-                    "(e.g. Q1 from May 2024 paired with Q1 from May 2021). "
-                    "Upload an MS PDF that contains every paper your Excel "
-                    "references, or filter Excel to match the MS you have.\n\n"
-                    "Continuing with empty MS so you can still review QP "
-                    "matching — but answers will be marked 'not found'."
+                    "The app will attempt to match what it can using the "
+                    "per-row topic-match validator. Rows whose MS topic "
+                    "doesn't match the question will be flagged as "
+                    "'MS answer mismatch' instead of being given a wrong "
+                    "answer. Rows with no MS section will show "
+                    "'Answer not found'.\n\n"
+                    "For best results, upload an MS PDF that contains every "
+                    "paper your Excel references."
                 )
-                # Disable MS assignment entirely
-                row_to_section = {ri: None for ri in row_to_section}
-            else:
+            elif len(ms_sections) != len(segments):
                 st.warning(
                     f"⚠ Excel has {len(segments)} paper segment(s) but MS PDF "
                     f"yielded {len(ms_sections)} section(s). Some answers may be "
