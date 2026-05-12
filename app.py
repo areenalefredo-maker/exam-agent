@@ -2821,54 +2821,70 @@ if st.button(
             "will be cropped from the QP PDF and embedded in the Word file."
         )
 
-    # ── CHANGE 13: Validation approval gate ─────────────────────────────────
-    # The user must review the table above and approve before the Word file
-    # is generated. This prevents "Answer not found" rows from appearing in
-    # the worksheet without the user's knowledge.
-    st.divider()
-    ms_missing_rows = [q for q in questions
-                       if not q.get("_ms_image") and not q.get("answerFound")]
-    if ms_missing_rows:
-        st.warning(
-            f"⚠️ **{len(ms_missing_rows)} question(s) have no MS answer found.**\n\n"
-            "Review the table above (look for ❌ / '— MS missing' status rows). "
-            "If you approve, those questions will show **'Answer not found — "
-            "needs review'** in the worksheet.\n\n"
-            "To fix: verify that the MS PDF contains the relevant paper "
-            "section, or update the Excel page numbers."
-        )
-
-    _approved = st.checkbox(
-        "✅ I have reviewed the validation table and approve generating the worksheet.",
-        key="user_approved",
+    # ── Build Word document & store in session_state ────────────────────────
+    ms_missing_n = sum(
+        1 for q in questions
+        if not q.get("_ms_image") and not q.get("answerFound")
     )
-    if not _approved:
-        st.info("Tick the checkbox above to enable the download.")
 
-    prog_bar  = st.progress(0)
-    prog_text = st.empty()
+    _prog_bar  = st.progress(0)
+    _prog_text = st.empty()
 
     def on_progress(done, total_, msg):
-        prog_bar.progress(done / max(total_, 1))
-        prog_text.text(msg)
+        _prog_bar.progress(done / max(total_, 1))
+        _prog_text.text(msg)
 
     with st.spinner("Building Word document…"):
         try:
-            docx_bytes = build_word_document(
+            _docx = build_word_document(
                 questions, qp_bytes, locations,
                 progress_cb=on_progress if visual_cnt else None,
-            ) if _approved else None
+            )
         except Exception as e:
             st.error(f"Word generation failed: {e}")
             st.stop()
 
-    if _approved and docx_bytes:
-        prog_bar.progress(1.0)
-        prog_text.empty()
+    _prog_bar.progress(1.0)
+    _prog_text.empty()
 
-        st.download_button(
-            label="⬇️ Download Worksheet (.docx)",
-            data=docx_bytes,
-            file_name="IB_Worksheet.docx",
-            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    # Persist in session_state — survives checkbox/rerun cycles
+    st.session_state["ws_docx"]    = _docx
+    st.session_state["ws_missing"] = ms_missing_n
+    st.session_state["ws_stats"]   = (
+        f"Total: {total} | Found in QP: {found_qp} | Answers found: {found_ms}"
+    )
+    st.session_state["ws_ready"]   = True
+    st.success("✅ Worksheet built — scroll down to download.")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PERSISTENT DOWNLOAD — outside button block, survives all reruns
+# ═══════════════════════════════════════════════════════════════════════════════
+if st.session_state.get("ws_ready") and st.session_state.get("ws_docx"):
+    st.divider()
+    st.subheader("⬇️ Download Worksheet")
+
+    _stats = st.session_state.get("ws_stats", "")
+    if _stats:
+        st.info(f"📊 {_stats}")
+
+    _missing = st.session_state.get("ws_missing", 0)
+    if _missing:
+        st.warning(
+            f"⚠️ {_missing} question(s) have no MS answer — "
+            "they will show 'Answer not found' in the worksheet."
         )
+
+    st.download_button(
+        label="⬇️ Download Worksheet (.docx)",
+        data=st.session_state["ws_docx"],
+        file_name="IB_Worksheet.docx",
+        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        key="persistent_dl",
+        type="primary",
+    )
+
+    if st.button("🔄 Start New Worksheet", key="reset_ws"):
+        for _k in ["ws_docx", "ws_missing", "ws_stats", "ws_ready"]:
+            st.session_state.pop(_k, None)
+        st.rerun()
