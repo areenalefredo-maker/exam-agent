@@ -80,8 +80,20 @@ st.divider()
 #  HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 def read_bytes(uploaded_file) -> bytes:
-    uploaded_file.seek(0)
-    return uploaded_file.read()
+    if uploaded_file is None:
+        return b""
+    if isinstance(uploaded_file, bytes):
+        return uploaded_file
+    if hasattr(uploaded_file, "getvalue"):
+        return uploaded_file.getvalue()
+    if hasattr(uploaded_file, "seek"):
+        try:
+            uploaded_file.seek(0)
+        except Exception:
+            pass
+    if hasattr(uploaded_file, "read"):
+        return uploaded_file.read()
+    raise TypeError(f"Unsupported uploaded file type: {type(uploaded_file)}")
 
 
 def to_b64(data: bytes) -> str:
@@ -1237,9 +1249,11 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     #   "1."  (most common)
     #   "1. (a)"  (when question content starts on same line)
     #   "1"   alone in bold (no dot — some Math MS use this style)
-    pat_strict = re.compile(r"^(\d{1,2})\.\s*$")
-    pat_qa     = re.compile(r"^(\d{1,2})\.\s+\(?\w")
-    pat_nodot  = re.compile(r"^(\d{1,2})\s*$")     # bare "1", "2", "10"
+    #   "Q1." / "Q1. (a)" — IB May 2025 TZ3 format (Q-prefix)
+    pat_strict  = re.compile(r"^(\d{1,2})\.\s*$")
+    pat_qa      = re.compile(r"^(\d{1,2})\.\s+\(?\w")
+    pat_nodot   = re.compile(r"^(\d{1,2})\s*$")     # bare "1", "2", "10"
+    pat_qprefix = re.compile(r"^Q(\d{1,2})\.\s*(?:\(?\w|$)")  # "Q1.", "Q1. (a)"
 
     for pi in range(len(doc)):
         page = doc[pi]
@@ -1262,16 +1276,21 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
                 if m:
                     qn = int(m.group(1))
                 else:
-                    # Try bare "1", "2", … but ONLY if it's bold AND sits at
-                    # the very left margin (x0 < 50pt). Instructions pages
-                    # also have bold "1", "2" but indented further right.
-                    m2 = pat_nodot.match(full_line)
-                    if m2 and bb[0] < 50:
-                        font = spans[0].get("font", "")
-                        size = spans[0].get("size", 0)
-                        # Bold AND reasonable body-text size (10-13pt)
-                        if ("Bold" in font or "bold" in font) and 9 <= size <= 14:
-                            qn = int(m2.group(1))
+                    # Q-prefix format: "Q1.", "Q2. EITHER", "Q10."
+                    mq = pat_qprefix.match(full_line)
+                    if mq:
+                        qn = int(mq.group(1))
+                    else:
+                        # Try bare "1", "2", … but ONLY if it's bold AND sits at
+                        # the very left margin (x0 < 50pt). Instructions pages
+                        # also have bold "1", "2" but indented further right.
+                        m2 = pat_nodot.match(full_line)
+                        if m2 and bb[0] < 50:
+                            font = spans[0].get("font", "")
+                            size = spans[0].get("size", 0)
+                            # Bold AND reasonable body-text size (10-13pt)
+                            if ("Bold" in font or "bold" in font) and 9 <= size <= 14:
+                                qn = int(m2.group(1))
 
                 if qn is None:
                     continue
@@ -2167,8 +2186,17 @@ if st.button(
 ):
     client = anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
 
+    # ── File validation before reading ──────────────────────────────────────
+    if not qp_file or not ms_file or not xl_file:
+        st.warning("Please upload QP PDF, MS PDF, and Excel file first.")
+        st.stop()
+
     qp_bytes = read_bytes(qp_file)
     ms_bytes = read_bytes(ms_file)
+
+    if not qp_bytes or not ms_bytes:
+        st.error("❌ Could not read one or more uploaded files. Please re-upload and try again.")
+        st.stop()
 
     # ── Safety check: did the user accidentally upload the same file twice? ─
     if qp_bytes == ms_bytes:
