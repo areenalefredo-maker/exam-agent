@@ -1645,18 +1645,47 @@ def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
     if not pieces:
         return None
 
-    # Stack vertically
+    # ── Split long answers into page-sized chunks ─────────────────────────────
+    # Each page in the Word document is ~A4 height at 150dpi ≈ 1754px.
+    # Content area (minus margins) ≈ 1400px. We allow ~1300px per chunk so
+    # the image is readable without shrinking to illegibility.
+    # If the total height fits in one chunk, we return one image; otherwise
+    # we split into multiple PNG chunks that the Word generator inserts
+    # sequentially (Part 1, Part 2, …).
+    MAX_CHUNK_H = 1300   # px at 150dpi — safe readable height per Word page
+
+    # First stack so we can measure total height
     total_w = max(p.size[0] for p in pieces)
     total_h = sum(p.size[1] for p in pieces)
-    stacked = Image.new("RGB", (total_w, total_h), "white")
-    y = 0
-    for p in pieces:
-        stacked.paste(p, (0, y))
-        y += p.size[1]
 
-    buf = io.BytesIO()
-    stacked.save(buf, format="PNG", optimize=True)
-    return buf.getvalue()
+    if total_h <= MAX_CHUNK_H:
+        # Short enough — return single image as before (bytes)
+        stacked = Image.new("RGB", (total_w, total_h), "white")
+        y_off = 0
+        for p in pieces:
+            stacked.paste(p, (0, y_off))
+            y_off += p.size[1]
+        buf = io.BytesIO()
+        stacked.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    # Tall answer — build full stacked image then slice into chunks
+    stacked = Image.new("RGB", (total_w, total_h), "white")
+    y_off = 0
+    for p in pieces:
+        stacked.paste(p, (0, y_off))
+        y_off += p.size[1]
+
+    chunks = []
+    y_cursor = 0
+    while y_cursor < total_h:
+        chunk = stacked.crop((0, y_cursor, total_w, min(y_cursor + MAX_CHUNK_H, total_h)))
+        buf = io.BytesIO()
+        chunk.save(buf, format="PNG", optimize=True)
+        chunks.append(buf.getvalue())
+        y_cursor += MAX_CHUNK_H
+
+    return chunks   # list of bytes — caller must handle multi-part insertion
 
 
 def extract_answers(client: anthropic.Anthropic, ms_b64: str,
@@ -2142,12 +2171,33 @@ def build_word_document(
                 # Structured mode: MS image (full worked solution) when present
                 ms_img_bytes = q.get("_ms_image")
                 if ms_img_bytes:
-                    aip = doc.add_paragraph()
-                    aip.paragraph_format.space_before = Pt(0)
-                    aip.paragraph_format.space_after  = Pt(2)
-                    aip.paragraph_format.keep_together = True
-                    aip.add_run().add_picture(io.BytesIO(ms_img_bytes),
-                                              width=Cm(CONTENT_WIDTH_CM - 1.0))
+                    # ms_img_bytes can be raw bytes (short answer) or a list
+                    # of bytes chunks (long answer split across pages).
+                    if isinstance(ms_img_bytes, (bytes, bytearray)):
+                        chunks_to_insert = [bytes(ms_img_bytes)]
+                    else:
+                        chunks_to_insert = list(ms_img_bytes)   # list of bytes
+
+                    for part_idx, chunk_bytes in enumerate(chunks_to_insert):
+                        if part_idx > 0:
+                            # Label continuation parts clearly
+                            cont_lbl = doc.add_paragraph()
+                            cont_lbl.paragraph_format.space_before = Pt(4)
+                            cont_lbl.paragraph_format.space_after  = Pt(2)
+                            cont_lbl.paragraph_format.keep_with_next = True
+                            _run(cont_lbl,
+                                 f"Answer from Mark Scheme (continued — Part {part_idx + 1}):",
+                                 bold=True, size_pt=10)
+
+                        aip = doc.add_paragraph()
+                        aip.paragraph_format.space_before = Pt(0)
+                        aip.paragraph_format.space_after  = Pt(4)
+                        # do NOT keep_together — let Word flow the image
+                        # naturally across pages rather than compressing it
+                        aip.add_run().add_picture(
+                            io.BytesIO(chunk_bytes),
+                            width=Cm(CONTENT_WIDTH_CM - 1.0)
+                        )
                 else:
                     av = doc.add_paragraph()
                     av.paragraph_format.space_before = Pt(0)
@@ -2489,6 +2539,31 @@ if st.button(
             for ri in segments[seg_idx]:
                 row_to_section[ri] = sec
                 row_to_section_idx[ri] = ms_idx
+
+        # ── Per-row override (safety net) ────────────────────────────────────
+        # Some rows end up in segments where no valid page_num exists, causing
+        # qp_code=None and wrong positional fallback. For every row, if the
+        # current section does NOT contain the row's Q#, re-derive the correct
+        # MS section directly from the row's own page_num via the static map.
+        if is_structured:
+            for ri, r in enumerate(xl_rows):
+                qn  = r.get("qn", 0)
+                sec = row_to_section.get(ri)
+                # Skip if already correctly assigned
+                if sec and isinstance(sec, dict) and sec.get("questions", {}).get(qn):
+                    continue
+                # Re-derive from this row's own page_num
+                pg = r.get("page_num", 0)
+                if not pg:
+                    continue
+                code = _pg_to_qp_code(pg)
+                if not code or code not in _STATIC_QP_TO_MS:
+                    continue
+                ms1, ms2 = _STATIC_QP_TO_MS[code]
+                new_idx, new_sec = _find_ms_sec_for_range(ms1, ms2, ms_sections)
+                if new_sec and new_sec.get("questions", {}).get(qn):
+                    row_to_section[ri]     = new_sec
+                    row_to_section_idx[ri] = new_idx
 
         # ── Diagnostic: paper / MS section matching table ──────────────────────
         # Safe rebuild of ms_code_to_section for diagnostic use only.
