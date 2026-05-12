@@ -113,8 +113,13 @@ def safe_json(text: str):
 def parse_excel(uploaded_file) -> list[dict]:
     """Read question numbers + metadata from Excel.
     Never used for question text or answers.
-    Sanitises: 'Error'/empty topic → 'Unclassified', marks 0/missing → 1.
+    CHANGE 3: always seeks to 0 — no cached reads.
+    CHANGE 4: Paper 2 rows are silently skipped.
+    CHANGE 5: 'October' is normalised to 'November' in Reference strings.
+    CHANGE 6: Date-encoded multi-page refs (e.g. 2026-06-07 → '6-7') kept.
+    CHANGE 7: marks=0 is kept as-is (will be corrected from QP later).
     """
+    # CHANGE 3: ensure clean read, no stale buffer
     uploaded_file.seek(0)
     wb = openpyxl.load_workbook(uploaded_file, read_only=True, data_only=True)
     ws = wb.active
@@ -191,15 +196,19 @@ def parse_excel(uploaded_file) -> list[dict]:
             continue
 
         topic = cell_val(row, top_idx)
+        # CHANGE 7: only mark as Unclassified when truly missing/error —
+        # do NOT override a valid chapter name like "Chapter 1 : Number & Algebra"
         if not topic or topic.strip().lower() in ("error", "none", "n/a", "nan"):
             topic = "Unclassified"
 
         try:
-            marks = int(float(cell_val(row, mrk_idx, "1")))
+            marks = int(float(cell_val(row, mrk_idx, "0")))
         except ValueError:
-            marks = 1
-        if marks <= 0:
-            marks = 1
+            marks = 0
+        # CHANGE 7: do NOT override marks=0 → keep it so the merge step
+        # can detect "[Maximum mark: N]" from the QP and correct it.
+        if marks < 0:
+            marks = 0
 
         # Page number — handle:
         #   - integers:   91
@@ -240,6 +249,21 @@ def parse_excel(uploaded_file) -> list[dict]:
         difficulty = cell_val(row, dif_idx, "Unspecified") or "Unspecified"
         ref        = cell_val(row, ref_idx, "")
         quote      = cell_val(row, qut_idx, "")
+
+        # CHANGE 5: normalise October → November (IB has no October session;
+        # some Excel files label the November session as "October")
+        ref = re.sub(r'\boctober\b', 'November', ref, flags=re.IGNORECASE)
+        ref = re.sub(r'\boct\b',     'Nov',      ref, flags=re.IGNORECASE)
+
+        # CHANGE 4: skip Paper 2 rows entirely.
+        # P2 paper codes contain: 7205, 7210, 7215, 7310, 7315, 7320
+        # Also skip explicit "Paper 2" / "HP2" / "SP2" references.
+        _P2_CODES = ('7205', '7210', '7215', '7310', '7315', '7320')
+        if any(code in ref for code in _P2_CODES):
+            continue
+        if re.search(r'\bpaper[\s\-]?2\b|[/\-_](?:h|s)p2[/\-_]', ref,
+                     re.IGNORECASE):
+            continue
 
         # ── Deduplication: only when EVERY identifying field is identical ───
         # Q1 from different references / pages / topics / difficulties are
@@ -937,6 +961,9 @@ def _norm_for_match(s: str) -> str:
     if not s:
         return ""
     s = s.lower()
+    # CHANGE 5: October = November in IB calendar
+    s = re.sub(r'\boctober\b', 'november', s)
+    s = re.sub(r'\boct\b',     'nov',      s)
     s = re.sub(r"[\(\)\[\]\{\}_\-,\.]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -1943,7 +1970,8 @@ def build_word_document(
 
                 # ── Meta line ─────────────────────────────────────────────────
                 # **Level of question**: Easy  |  **Number of Marks: **1
-                # (Reference is used internally for matching, NOT shown.)
+                # CHANGE 8: Reference is NEVER shown in the Word output.
+                # It is used only internally for QP/MS matching.
                 mp = doc.add_paragraph()
                 mp.paragraph_format.space_before = Pt(0)
                 mp.paragraph_format.space_after  = Pt(2)
@@ -2079,8 +2107,9 @@ def build_word_document(
                 sl.paragraph_format.space_after  = Pt(2)
                 _run(sl, "Student's Solution:", bold=True, size_pt=11)
 
-                # 4 writing lines (matches reference exactly)
-                _add_solution_box(doc, n_lines=4)
+                # CHANGE: solution box height proportional to marks
+                # (min 6 lines so short questions still have room to work)
+                _add_solution_box(doc, n_lines=max(6, (marks or 1) * 2))
 
                 # ── Answer from Mark Scheme ────────────────────────────────────
                 ap = doc.add_paragraph()
@@ -2484,6 +2513,33 @@ if st.button(
             sec = row_to_section.get(i)
             sec_idx = row_to_section_idx.get(i, -1)
             found_q   = bool(qp_q) and qp_q.get("found") is not False
+
+            # CHANGE 4 (Structured only): skip rows not found in QP when a
+            # page number was provided — these are almost certainly Paper 2.
+            # In MCQ mode we keep all rows so the user sees what's missing.
+            if is_structured and not found_q and r.get("page_num", 0) > 0:
+                continue
+
+            # CHANGE 7 (Structured only): if marks=0, read "[Maximum mark: N]"
+            # from the QP page. For MCQ mode, 0 simply falls back to 1.
+            if r.get("marks", 0) == 0:
+                if is_structured and qp_q.get("_loc"):
+                    try:
+                        _tmp = fitz.open(stream=qp_bytes, filetype="pdf")
+                        _ptxt = _tmp[qp_q["_loc"]["page_idx"]].get_text()
+                        _tmp.close()
+                        _mm = re.search(
+                            r'\[Maximum mark[:\s]+(\d+)\]', _ptxt, re.IGNORECASE
+                        )
+                        if _mm:
+                            r = dict(r)       # shallow copy before mutating
+                            r["marks"] = int(_mm.group(1))
+                    except Exception:
+                        pass
+                # Still 0 → default to 1 (works for both modes)
+                if r.get("marks", 0) == 0:
+                    r = dict(r)
+                    r["marks"] = 1
             # In Structured mode (Math, etc.) we always crop QP as image
             # because equations / diagrams / fractions can't be reliably
             # rendered as plain text.
@@ -2723,6 +2779,30 @@ if st.button(
             "will be cropped from the QP PDF and embedded in the Word file."
         )
 
+    # ── CHANGE 13: Validation approval gate ─────────────────────────────────
+    # The user must review the table above and approve before the Word file
+    # is generated. This prevents "Answer not found" rows from appearing in
+    # the worksheet without the user's knowledge.
+    st.divider()
+    ms_missing_rows = [q for q in questions
+                       if not q.get("_ms_image") and not q.get("answerFound")]
+    if ms_missing_rows:
+        st.warning(
+            f"⚠️ **{len(ms_missing_rows)} question(s) have no MS answer found.**\n\n"
+            "Review the table above (look for ❌ / '— MS missing' status rows). "
+            "If you approve, those questions will show **'Answer not found — "
+            "needs review'** in the worksheet.\n\n"
+            "To fix: verify that the MS PDF contains the relevant paper "
+            "section, or update the Excel page numbers."
+        )
+
+    _approved = st.checkbox(
+        "✅ I have reviewed the validation table and approve generating the worksheet.",
+        key="user_approved",
+    )
+    if not _approved:
+        st.info("Tick the checkbox above to enable the download.")
+
     prog_bar  = st.progress(0)
     prog_text = st.empty()
 
@@ -2735,17 +2815,18 @@ if st.button(
             docx_bytes = build_word_document(
                 questions, qp_bytes, locations,
                 progress_cb=on_progress if visual_cnt else None,
-            )
+            ) if _approved else None
         except Exception as e:
             st.error(f"Word generation failed: {e}")
             st.stop()
 
-    prog_bar.progress(1.0)
-    prog_text.empty()
+    if _approved and docx_bytes:
+        prog_bar.progress(1.0)
+        prog_text.empty()
 
-    st.download_button(
-        label="⬇️ Download Worksheet (.docx)",
-        data=docx_bytes,
-        file_name="IB_Worksheet.docx",
-        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    )
+        st.download_button(
+            label="⬇️ Download Worksheet (.docx)",
+            data=docx_bytes,
+            file_name="IB_Worksheet.docx",
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
