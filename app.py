@@ -16,6 +16,70 @@ import numpy as np
 import fitz
 from PIL import Image
 
+
+def parse_page_range(raw_page: str, max_pages: int = 9999) -> tuple[int, int] | None:
+    """Parse Excel page-number cell into (start_page, end_page).
+
+    Handles:
+      "91"          → (91, 91)    – plain page number
+      "10-11"       → (10, 11)   – explicit range with dash
+      "1011"        → (10, 11)   – merged-digit range
+      "1920"        → (19, 20)   – merged-digit range
+      "3032"        → (30, 32)   – merged-digit range
+      "2026-10-11"  → (10, 11)   – Excel auto-converted date (month-day)
+    Returns None when the value is unparseable.
+    """
+    if not raw_page:
+        return None
+    raw = str(raw_page).strip()
+
+    # Explicit dash/en-dash range: "10-11", "10–11"
+    m = re.match(r'^(\d+)\s*[-\u2013\u2014]\s*(\d+)$', raw)
+    if m:
+        s, e = int(m.group(1)), int(m.group(2))
+        if 1 <= s and s <= e <= max_pages + 20:
+            return (s, e)
+
+    # Excel auto-converted date "YYYY-MM-DD" → take month and day
+    m = re.match(r'^\d{4}-(\d{1,2})-(\d{1,2})$', raw)
+    if m:
+        s, e = int(m.group(1)), int(m.group(2))
+        if 1 <= s <= max_pages and s <= e:
+            return (s, e)
+
+    # Plain integer
+    m = re.match(r'^(\d+)$', raw)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= max_pages:
+            return (n, n)
+        # Attempt merged-range split: 1011 → 10-11, 1920 → 19-20, 3032 → 30-32
+        s_raw = str(n)
+        L = len(s_raw)
+        best = None
+        for split in range(1, L):
+            s = int(s_raw[:split])
+            e = int(s_raw[split:])
+            if (1 <= s <= max_pages and s < e <= max_pages + 20
+                    and 1 <= e - s <= 15):
+                if best is None:
+                    best = (s, e)
+                else:
+                    curr_diff = abs(split - (L - split))
+                    prev_split = len(str(best[0]))
+                    prev_diff  = abs(prev_split - (L - prev_split))
+                    if curr_diff < prev_diff:
+                        best = (s, e)
+        return best  # None if no valid split found
+
+    # Fallback: first integer in the cell
+    m = re.search(r'\d+', raw)
+    if m:
+        n = int(m.group())
+        if 1 <= n <= max_pages:
+            return (n, n)
+    return None
+
 from docx import Document
 from docx.shared import Pt, Cm, Inches, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
@@ -202,22 +266,22 @@ def parse_excel(uploaded_file) -> list[dict]:
                 if v is None:
                     raw_page = ""
                 elif isinstance(v, datetime.datetime):
+                    # Excel auto-converted "10-11" → date: recover month-day
                     raw_page = f"{v.month}-{v.day}"
                 else:
                     raw_page = str(v).strip()
             except (IndexError, AttributeError):
                 raw_page = ""
 
-        page_num = 0
+        page_num     = 0
+        page_num_end = 0   # end page for multi-page questions
         if raw_page:
-            m = re.search(r"\d+", raw_page)
-            if m:
-                try:
-                    candidate = int(m.group())
-                    if 1 <= candidate <= 9999:
-                        page_num = candidate
-                except ValueError:
-                    page_num = 0
+            pr = parse_page_range(raw_page)   # no max_pages at parse time
+            if pr:
+                page_num, page_num_end = pr
+            else:
+                # Could not interpret — keep 0 (will warn during generation)
+                pass
 
         difficulty = cell_val(row, dif_idx, "Unspecified") or "Unspecified"
         ref        = cell_val(row, ref_idx, "")
@@ -240,8 +304,9 @@ def parse_excel(uploaded_file) -> list[dict]:
         seen_keys.add(dedup_key)
 
         rows.append({
-            "qn": q_num, "page_num": page_num, "topic": topic,
-            "difficulty": difficulty, "marks": marks, "quote": quote, "ref": ref,
+            "qn": q_num, "page_num": page_num, "page_num_end": page_num_end,
+            "topic": topic, "difficulty": difficulty, "marks": marks,
+            "quote": quote, "ref": ref,
         })
 
     parse_excel.last_duplicates = duplicates
@@ -1078,12 +1143,38 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
     return img, has_cont
 
 
-def _crop_qp_full(qp_doc, pg, qn):
+def _crop_qp_full(qp_doc, pg, qn, pg_end: int = 0):
+    """Crop QP question qn from page pg (through pg_end if it spans pages).
+
+    pg_end:  last page of this question (inclusive).  0 → auto-detect via
+             'continues on following page' text in the PDF.
+    """
     if not pg or pg > len(qp_doc):
         return None
+
     img1, hc = _crop_qp_page(qp_doc, pg - 1, qn, False)
     if img1 is None:
         return None
+
+    # ── If Excel told us the page range, use it directly ─────────────────────
+    if pg_end and pg_end > pg:
+        pieces = [img1]
+        for pn in range(pg + 1, pg_end + 1):
+            if pn > len(qp_doc):
+                break
+            ic, _ = _crop_qp_page(qp_doc, pn - 1, qn, True)
+            if ic is not None:
+                pieces.append(ic)
+        tw = max(p.size[0] for p in pieces)
+        th = sum(p.size[1] for p in pieces)
+        c  = Image.new("RGB", (tw, th), "white")
+        y  = 0
+        for p in pieces:
+            c.paste(p, (0, y))
+            y += p.size[1]
+        return c
+
+    # ── Auto-detect via "continues on following page" ─────────────────────────
     if not hc:
         return img1
     pieces = [img1]
@@ -1430,8 +1521,9 @@ def build_structured_worksheet(
                 if qn == 9 and pg == 147:
                     marks = 6
 
-                # Crop QP
-                qp_img = _crop_qp_full(qp_doc, pg, qn)
+                # Crop QP (pass pg_end so multi-page questions are complete)
+                pg_end = r.get("page_num_end", 0) or 0
+                qp_img = _crop_qp_full(qp_doc, pg, qn, pg_end=pg_end)
 
                 # Crop MS
                 sec     = row_to_section.get(ri)
@@ -1931,8 +2023,15 @@ if st.button(
                     st.error(f"❌ Missing column(s): {', '.join(unmapped)}")
 
         zero_page_count = sum(1 for r in xl_rows if not r.get("page_num"))
+        range_count     = sum(1 for r in xl_rows
+                              if r.get("page_num_end", 0) > r.get("page_num", 0))
         if zero_page_count > len(xl_rows) * 0.1:
-            st.warning(f"⚠ {zero_page_count}/{len(xl_rows)} rows have Page Number = 0.")
+            st.warning(f"⚠ {zero_page_count}/{len(xl_rows)} rows have Page Number = 0. "
+                       "Check the Page Number column in your Excel.")
+        if range_count:
+            st.info(f"ℹ️ {range_count} question(s) span multiple pages "
+                    f"(e.g. '1011' interpreted as pages 10–11) — "
+                    "they will be cropped across all specified pages.")
 
         dups = getattr(parse_excel, "last_duplicates", [])
         if dups:
@@ -2087,7 +2186,17 @@ if st.button(
                         pass
                 if r2.get("marks", 0) == 0:
                     r2["marks"] = 1
-                clean_rows.append((i, r2))
+                # Validate / clamp page_num_end against actual PDF length
+            pg_end_raw = r2.get("page_num_end", 0) or 0
+            try:
+                qp_n_pages = len(fitz.open(stream=qp_bytes, filetype="pdf"))
+            except Exception:
+                qp_n_pages = 9999
+            if pg_end_raw > qp_n_pages:
+                r2["page_num_end"] = qp_n_pages
+            elif pg_end_raw < r2.get("page_num", 1):
+                r2["page_num_end"] = r2.get("page_num", 1)
+            clean_rows.append((i, r2))
 
             # Build questions list for validation display
             questions = []
