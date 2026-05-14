@@ -15,6 +15,7 @@ import datetime
 
 import fitz                           # PyMuPDF — PDF inspection + rendering
 from PIL import Image
+import numpy as np
 
 from docx import Document
 from docx.shared import Pt, Cm, Inches, RGBColor
@@ -1212,6 +1213,9 @@ def _build_page_to_paper_map(pdf_bytes: bytes) -> dict:
     return page_to_code
 
 
+# Continuation text patterns — skip in MS crops
+MS_CONT_PAT = re.compile(r'question\s*\d*\s*continued\.?|this question continues', re.I)
+
 def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     """For structured MS (e.g. Math): find every question's bounding box
     across all pages of the MS PDF.
@@ -1530,7 +1534,7 @@ def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
 
     def find_header_bottom(page) -> float:
         """Return the y1 of the page-header block (page number / exam code
-        at the top of the page). Anything above this is junk."""
+        at the top of the page). Also skips 'Question N continued' lines."""
         ph_ = page.rect.height
         td = page.get_text("dict")
         header_y1 = 0
@@ -1550,16 +1554,16 @@ def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
                 if not text:
                     continue
                 bb = line["bbox"]
-                if bb[1] > ph_ * 0.12:
+                if bb[1] > ph_ * 0.20:
                     continue
-                if header_pat.search(text):
+                if header_pat.search(text) or MS_CONT_PAT.search(text):
                     if bb[3] > header_y1:
                         header_y1 = bb[3]
         return header_y1
 
     def find_last_content_y(page, top_y: float, hard_bottom: float) -> float:
         """Return the y1 of the LAST real content line between top_y and
-        hard_bottom on this page."""
+        hard_bottom on this page. Skips continuation headers."""
         ph_ = page.rect.height
         td = page.get_text("dict")
         last_y1 = top_y
@@ -1579,6 +1583,8 @@ def crop_ms_question_image(ms_bytes: bytes, q_info: dict,
                 if bb[1] >= hard_bottom - 2:
                     continue
                 if is_ms_footer(text, bb[1], ph_):
+                    continue
+                if MS_CONT_PAT.search(text):
                     continue
                 if bb[3] > last_y1:
                     last_y1 = bb[3]
@@ -1847,20 +1853,20 @@ def _hr(doc, color="CCCCCC"):
     return p
 
 
-def _add_solution_box(doc, n_lines: int = 4):
-    """Reference format: 4-row table, each row ~0.9 cm tall,
-       only a thin bottom border (#BFBFBF) — produces 4 writing lines.
+def _add_solution_box(doc, n_lines: int = 4, row_height_twips: int = 560):
+    """Table with bottom-border writing lines.
+       row_height_twips: 560 = 28pt (default), 510 = ~25pt (compact)
     """
+    n_lines = max(4, min(n_lines, 10))
     table = doc.add_table(rows=n_lines, cols=1)
     table.autofit = False
     for cell in table.columns[0].cells:
         cell.width = Cm(CONTENT_WIDTH_CM)
 
     for row in table.rows:
-        # Row height = 510 twips (matches reference)
         trPr = row._tr.get_or_add_trPr()
         trH  = OxmlElement("w:trHeight")
-        trH.set(docx_qn("w:val"), "510")
+        trH.set(docx_qn("w:val"), str(row_height_twips))
         trPr.append(trH)
 
         cell = row.cells[0]
@@ -1870,7 +1876,7 @@ def _add_solution_box(doc, n_lines: int = 4):
             ("top",    "nil",    "0", "auto"),
             ("left",   "nil",    "0", "auto"),
             ("right",  "nil",    "0", "auto"),
-            ("bottom", "single", "4", "BFBFBF"),
+            ("bottom", "single", "6", "BFBFBF"),
         ]:
             b = OxmlElement(f"w:{side}")
             b.set(docx_qn("w:val"), val)
@@ -2157,22 +2163,65 @@ def build_word_document(
                             _run(op, f"{L}.  {opts[L]}", size_pt=11)
 
                 # ── Student's Solution (bold 11pt) ─────────────────────────────
-                sl = doc.add_paragraph()
-                sl.paragraph_format.space_before = Pt(8)
-                sl.paragraph_format.space_after  = Pt(2)
-                _run(sl, "Student's Solution:", bold=True, size_pt=11)
+                if is_structured:
+                    # Dynamic sol_box: calculate rows from QP image height
+                    _q_loc = q.get("_loc")
+                    _img_h_pt = 0
+                    if _q_loc:
+                        _img_h_pt = ((_q_loc.get("bottom_y", 0) - _q_loc.get("top_y", 0))
+                                     / 72 * 72)  # keep as pt
+                    _CW_PT_s = (CONTENT_WIDTH_CM - 1.0) * 28.35
+                    _PAGE_H_s = 728.0; _HDR_s = 125; _SOL_LBL_s = 30
+                    _SOL_ROW_s = 28; _SAFETY_s = 20; _IMG_THRESH_s = 380
+                    # Estimate rendered image pt height from QP location
+                    _qp_img_bytes = crop_question_png(qp_bytes, _q_loc) if _q_loc else None
+                    _img_render_pt = 0
+                    if _qp_img_bytes:
+                        try:
+                            _pil = Image.open(io.BytesIO(_qp_img_bytes))
+                            _iw, _ih = _pil.size
+                            _img_render_pt = (_ih / _iw) * _CW_PT_s
+                        except Exception:
+                            pass
+                    _sol_separate = (_img_render_pt > _IMG_THRESH_s)
+                    if _sol_separate:
+                        _n_sol = 6
+                    else:
+                        _avail = _PAGE_H_s - _HDR_s - _img_render_pt - _SOL_LBL_s - _SAFETY_s
+                        _n_sol = max(4, min(int(_avail / _SOL_ROW_s), 8))
 
-                # CHANGE: solution box height proportional to marks
-                # (min 6 lines so short questions still have room to work)
-                _add_solution_box(doc, n_lines=max(6, (marks or 1) * 2))
+                    if _sol_separate:
+                        # Large question: sol on its own page
+                        _pb2 = doc.add_paragraph()
+                        _pb2.paragraph_format.page_break_before = True
+                        _pb2.paragraph_format.space_before = Pt(0)
+                        _pb2.paragraph_format.space_after  = Pt(0)
+
+                    sl = doc.add_paragraph()
+                    sl.paragraph_format.space_before = Pt(8 if not _sol_separate else 0)
+                    sl.paragraph_format.space_after  = Pt(2)
+                    sl.paragraph_format.keep_with_next = True
+                    _run(sl, "Student's Solution:", bold=True, size_pt=11)
+                    _add_solution_box(doc, n_lines=_n_sol)
+                else:
+                    sl = doc.add_paragraph()
+                    sl.paragraph_format.space_before = Pt(8)
+                    sl.paragraph_format.space_after  = Pt(2)
+                    _run(sl, "Student's Solution:", bold=True, size_pt=11)
+                    _add_solution_box(doc, n_lines=max(6, (marks or 1) * 2))
+
+                # ── Page break → Answer from Mark Scheme on separate page ───────
+                if is_structured:
+                    _pb_ms = doc.add_paragraph()
+                    _pb_ms.paragraph_format.page_break_before = True
+                    _pb_ms.paragraph_format.space_before = Pt(0)
+                    _pb_ms.paragraph_format.space_after  = Pt(0)
 
                 # ── Answer from Mark Scheme ────────────────────────────────────
                 ap = doc.add_paragraph()
-                ap.paragraph_format.space_before = Pt(8)
-                ap.paragraph_format.space_after  = Pt(2)
-                # Keep the header glued to the answer below — no orphan headers
+                ap.paragraph_format.space_before = Pt(0)
+                ap.paragraph_format.space_after  = Pt(4)
                 ap.paragraph_format.keep_with_next = True
-                ap.paragraph_format.keep_together = True
                 _run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
                 # Structured mode: MS image (full worked solution) when present
@@ -2186,24 +2235,39 @@ def build_word_document(
                         chunks_to_insert = list(ms_img_bytes)   # list of bytes
 
                     for part_idx, chunk_bytes in enumerate(chunks_to_insert):
-                        if part_idx > 0:
-                            # Label continuation parts clearly
-                            cont_lbl = doc.add_paragraph()
-                            cont_lbl.paragraph_format.space_before = Pt(4)
-                            cont_lbl.paragraph_format.space_after  = Pt(2)
-                            cont_lbl.paragraph_format.keep_with_next = True
-                            _run(cont_lbl,
-                                 f"Answer from Mark Scheme (continued — Part {part_idx + 1}):",
-                                 bold=True, size_pt=10)
-
+                        # NO "continued" labels — just insert images sequentially
                         aip = doc.add_paragraph()
                         aip.paragraph_format.space_before = Pt(0)
                         aip.paragraph_format.space_after  = Pt(4)
-                        # do NOT keep_together — let Word flow the image
-                        # naturally across pages rather than compressing it
-                        aip.add_run().add_picture(
+                        # Wrap in a cantSplit table so Word won't break mid-image
+                        _t = doc.add_table(rows=1, cols=1)
+                        _t.autofit = False
+                        _t.columns[0].width = Cm(CONTENT_WIDTH_CM - 0.5)
+                        _cell = _t.rows[0].cells[0]
+                        _trPr = _t.rows[0]._tr.get_or_add_trPr()
+                        _cs = OxmlElement("w:cantSplit")
+                        _cs.set(docx_qn("w:val"), "1")
+                        _trPr.append(_cs)
+                        _tcPr = _cell._tc.get_or_add_tcPr()
+                        _tcB = OxmlElement("w:tcBorders")
+                        for _side in ["top","left","bottom","right","insideH","insideV"]:
+                            _b = OxmlElement(f"w:{_side}")
+                            _b.set(docx_qn("w:val"), "nil")
+                            _tcB.append(_b)
+                        _tcPr.append(_tcB)
+                        _tcMar = OxmlElement("w:tcMar")
+                        for _s in ["top","left","bottom","right"]:
+                            _m = OxmlElement(f"w:{_s}")
+                            _m.set(docx_qn("w:w"), "0")
+                            _m.set(docx_qn("w:type"), "dxa")
+                            _tcMar.append(_m)
+                        _tcPr.append(_tcMar)
+                        _p2 = _cell.paragraphs[0]
+                        _p2.paragraph_format.space_before = Pt(0)
+                        _p2.paragraph_format.space_after  = Pt(4)
+                        _p2.add_run().add_picture(
                             io.BytesIO(chunk_bytes),
-                            width=Cm(CONTENT_WIDTH_CM - 1.0)
+                            width=Cm(CONTENT_WIDTH_CM - 0.5)
                         )
                 else:
                     # No MS image available
@@ -2223,16 +2287,16 @@ def build_word_document(
                     else:
                         _run(av, answer, bold=True, size_pt=12)
 
-                # ── Separator before Keep it up ────────────────────────────────
-                _hr(doc, color="BFBFBF")
-
-                # ── Keep it up: ────────────────────────────────────────────────
+                # ── Separator + Keep it up (after MS content) ──────────────────
                 if quote:
+                    _hr(doc, color="BFBFBF")
                     qup = doc.add_paragraph()
-                    qup.paragraph_format.space_before = Pt(2)
+                    qup.paragraph_format.space_before = Pt(4)
                     qup.paragraph_format.space_after  = Pt(2)
                     _run(qup, "Keep it up", bold=True, size_pt=11)
                     _run(qup, f" : {quote}",       size_pt=11)
+                elif not is_structured:
+                    _hr(doc, color="BFBFBF")
 
                 is_first_q_in_diff = False
 
@@ -2608,6 +2672,10 @@ if st.button(
             # In MCQ mode we keep all rows so the user sees what's missing.
             if is_structured and not found_q and r.get("page_num", 0) > 0:
                 continue
+
+            # Special override: known wrong marks in Excel
+            if r.get("qn") == 9 and r.get("page_num") == 147:
+                r = dict(r); r["marks"] = 6
 
             # CHANGE 7 (Structured only): if marks=0, read "[Maximum mark: N]"
             # from the QP page. For MCQ mode, 0 simply falls back to 1.
