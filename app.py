@@ -2151,18 +2151,22 @@ if st.button(
 
         # ── 4) Row → MS section mapping ──────────────────────────────────────────
         #
-        # Problem: MS PDFs for IB Math typically contain BOTH SL and HL sections
-        # interleaved (SL section, then HL section, for each exam session).
-        # Excel rows are HL-only (or a single paper type).
-        # Pure positional mapping therefore pairs the wrong sections.
+        # IB MS PDFs interleave SL and HL sections for each exam session:
+        #   [SL exam1, HL exam1, SL exam2, HL exam2, ...]
         #
-        # Fix strategy:
-        #   1. Determine the max question number per Excel segment (= paper type).
-        #   2. Filter MS sections to only those whose max question number is
-        #      "compatible" (within ±2) with the Excel segment max_qn.
-        #   3. When counts differ (MS has SL+HL, Excel has HL only), pick only
-        #      the compatible subset and map positionally within that subset.
-        #   4. Fallback: if counts match exactly, use standard positional mapping.
+        # Excel rows represent ONE paper type (e.g. HL only, or SL only,
+        # or a single paper number). We must select ONLY the matching subset.
+        #
+        # Algorithm:
+        #   1. Sort segments by their first QP page (chronological exam order).
+        #   2. Compute max_qn for each segment and the Excel overall max_qn.
+        #   3. If n_ms ≈ k × n_segs (k=2 typical for SL+HL):
+        #        a) Try BOTH alternations (even indices vs odd indices).
+        #        b) Choose the alternation whose average max_qn is CLOSER
+        #           to the Excel overall_max_qn.
+        #        c) If neither alternation gives enough sections, use threshold filter.
+        #   4. If n_ms == n_segs: direct positional mapping.
+        #   5. If n_ms < n_segs: direct positional with warnings.
         # ─────────────────────────────────────────────────────────────────────────
 
         row_to_section     = {}
@@ -2176,52 +2180,85 @@ if st.button(
         def _seg_max_qn(seg_rows_):
             return max((xl_rows[ri].get("qn", 0) for ri in seg_rows_), default=0)
 
-        sorted_seg_indices = sorted(range(len(segments)), key=lambda i: _seg_min_page(segments[i]))
-
-        # Compute max_qn for each segment (= highest question number in that segment)
-        seg_max_qns = [_seg_max_qn(segments[si]) for si in range(len(segments))]
-        overall_excel_max_qn = max(seg_max_qns) if seg_max_qns else 13
-
-        # ── Filter MS sections that are compatible with the Excel paper type ─────
-        # Compatible = max question number within ±3 of the Excel segment max qn,
-        # OR if the MS section covers more questions than the SL counterpart.
-        # When the MS has twice as many sections as Excel segments (SL+HL combined),
-        # pick only the sections whose max_qn >= (overall_excel_max_qn - 2).
+        sorted_seg_indices = sorted(range(len(segments)),
+                                    key=lambda i: _seg_min_page(segments[i]))
         n_segs = len(segments)
         n_ms   = len(ms_sections)
 
-        if n_ms >= 2 * n_segs:
-            # MS has ~2× sections → contains both SL and HL (or TZ1+TZ2 with different counts)
-            # Keep only the sections compatible with Excel's question count
-            threshold = max(overall_excel_max_qn - 2, 10)
-            compatible_ms = [
-                (orig_idx, sec)
-                for orig_idx, sec in enumerate(ms_sections)
-                if isinstance(sec, dict) and sec.get("max_qn", len(sec.get("questions", {}))) >= threshold
-            ]
-            # Fallback: if that still doesn't give enough, use every other section
-            if len(compatible_ms) < n_segs:
-                # Take every second section starting from index 1 (the HL one in each pair)
-                compatible_ms = [
-                    (orig_idx, sec)
-                    for orig_idx, sec in enumerate(ms_sections)
-                    if orig_idx % 2 == 1
-                ]
-            # If still not enough, fall back to all sections
-            if len(compatible_ms) < n_segs:
-                compatible_ms = list(enumerate(ms_sections))
-        else:
-            # MS count roughly matches Excel segments → use all sections
+        # Max question numbers
+        seg_max_qns        = [_seg_max_qn(segments[si]) for si in range(n_segs)]
+        overall_excel_max_qn = max(seg_max_qns) if seg_max_qns else 13
+
+        def _ms_max_qn(sec):
+            return sec.get("max_qn", len(sec.get("questions", {}))) if isinstance(sec, dict) else 0
+
+        # ── Select compatible MS sections ─────────────────────────────────────────
+        if n_ms == n_segs:
+            # Perfect count match → direct positional
             compatible_ms = list(enumerate(ms_sections))
+            match_method  = "Direct positional"
+
+        elif n_ms > n_segs:
+            # MS has more sections than Excel segments
+            # Try every-k-th alternation for k = n_ms // n_segs
+            k = n_ms // n_segs
+            best_alt  = None
+            best_diff = float("inf")
+
+            for start in range(k):
+                alt = [(i, ms_sections[i])
+                       for i in range(start, n_ms, k)
+                       if i < n_ms]
+                if len(alt) < n_segs:
+                    continue
+                alt = alt[:n_segs]
+                avg_max_qn = sum(_ms_max_qn(s) for _, s in alt) / len(alt)
+                diff = abs(avg_max_qn - overall_excel_max_qn)
+                if diff < best_diff:
+                    best_diff = diff
+                    best_alt  = alt
+
+            if best_alt and len(best_alt) >= n_segs:
+                compatible_ms = best_alt[:n_segs]
+                match_method  = f"Every-{k}-th alternation (start={compatible_ms[0][0]}, avg_max_qn={sum(_ms_max_qn(s) for _,s in compatible_ms)/len(compatible_ms):.1f})"
+            else:
+                # Alternation didn't work → filter by max_qn proximity
+                threshold = max(overall_excel_max_qn - 3, 8)
+                compatible_ms = [
+                    (i, s) for i, s in enumerate(ms_sections)
+                    if _ms_max_qn(s) >= threshold
+                ][:n_segs]
+                match_method  = f"Threshold filter (max_qn>={threshold})"
+
+            if len(compatible_ms) < n_segs:
+                # Last resort: take the last n_segs sections
+                compatible_ms = list(enumerate(ms_sections))[-n_segs:]
+                match_method  += " [last-resort fallback]"
+
+        else:
+            # n_ms < n_segs — fewer MS sections than segments
+            compatible_ms = list(enumerate(ms_sections))
+            match_method  = f"Partial ({n_ms} MS < {n_segs} Excel segs)"
 
         # ── Positional mapping within compatible MS sections ──────────────────────
-        seg_paper_codes = [None] * len(segments)
+        seg_paper_codes    = [None] * n_segs
+        mismatch_warnings  = []
+
         for pos, seg_idx in enumerate(sorted_seg_indices):
             seg_rows = segments[seg_idx]
             if pos < len(compatible_ms):
                 orig_ms_idx, sec = compatible_ms[pos]
+                # Sanity check: max_qn of MS section should be ≥ segment's max_qn
+                seg_mq = seg_max_qns[seg_idx]
+                ms_mq  = _ms_max_qn(sec)
+                if ms_mq > 0 and abs(ms_mq - seg_mq) > 3:
+                    mismatch_warnings.append(
+                        f"Seg{seg_idx+1}(max_q={seg_mq}) ↔ MSsec{orig_ms_idx+1}(max_q={ms_mq}) "
+                        f"— difference={abs(ms_mq-seg_mq)}"
+                    )
             else:
                 orig_ms_idx, sec = -1, None
+                mismatch_warnings.append(f"Seg{seg_idx+1} has no matching MS section")
             ms_idx = orig_ms_idx
             for ri in seg_rows:
                 row_to_section[ri]     = sec
@@ -2237,7 +2274,7 @@ if st.button(
             ms_code_to_section = {}
 
         paired_by_code = sum(1 for code in seg_paper_codes if code and code in ms_code_to_section)
-        unpaired_segs  = []
+        unpaired_segs  = mismatch_warnings
 
         if is_structured:
             match_table = []
@@ -2246,17 +2283,30 @@ if st.button(
                 ms_sec   = row_to_section.get(seg_rows[0])
                 ms_code  = (ms_sec.get("paper_code") if isinstance(ms_sec, dict) else None)
                 ref_str  = xl_rows[seg_rows[0]].get("ref", "") if seg_rows else ""
+                seg_mq   = seg_max_qns[seg_idx]
+                ms_mq    = _ms_max_qn(ms_sec) if ms_sec else 0
+                ok       = ms_mq == 0 or abs(ms_mq - seg_mq) <= 3
                 match_table.append({
                     "Seg#":        seg_idx + 1,
                     "Excel Ref":   ref_str[:40],
+                    "Seg max Q":   seg_mq,
                     "MS section#": ms_sec_i + 1 if ms_sec_i >= 0 else "—",
-                    "MS code":     ms_code or "—",
-                    "Method":      "HL-filtered" if n_ms >= 2 * n_segs else "Positional",
-                    "Questions":   len(seg_rows),
+                    "MS max Q":    ms_mq or "—",
+                    "Match":       "✅" if ok else "⚠️",
                     "MS Qs avail": len(ms_sec.get("questions", {})) if ms_sec else 0,
                 })
-            with st.expander(f"📋 Paper ↔ MS Section Matching ({paired_by_code} by code, {len(unpaired_segs)} positional)", expanded=True):
+            n_warn = len([r for r in match_table if r["Match"] == "⚠️"])
+            with st.expander(
+                f"📋 Paper ↔ MS Matching — {match_method}  "
+                f"({'⚠️ ' + str(n_warn) + ' mismatches' if n_warn else '✅ all OK'})",
+                expanded=(n_warn > 0)
+            ):
                 st.dataframe(match_table, use_container_width=True, hide_index=True)
+                if n_warn:
+                    st.warning(
+                        f"⚠️ {n_warn} segment(s) may have mismatched MS sections. "
+                        "Details:\n" + "\n".join(f"• {w}" for w in mismatch_warnings)
+                    )
 
         if len(ms_sections) != len(segments):
             ratio = len(ms_sections) / max(len(segments), 1)
