@@ -1644,33 +1644,20 @@ def build_structured_worksheet(
                 pg_end = r.get("page_num_end", 0) or 0
                 qp_img = _crop_qp_full(qp_doc, pg, qn, pg_end=pg_end)
 
-                # Crop MS — with topic-coherence check
+                # Crop MS
                 sec     = row_to_section.get(ri)
                 ms_imgs = []
-                ms_topic_mismatch = False
+                ms_topic_mismatch = False   # kept for display logic below
                 if sec and isinstance(sec, dict):
                     q_info = sec.get("questions", {}).get(qn)
                     if q_info:
-                        # Quick coherence check: does MS page mention any QP keywords?
-                        try:
-                            _ms_pg_txt = ms_doc[q_info["page_idx"]].get_text().lower()
-                            _qp_pg_txt = qp_doc[max(0, pg-1)].get_text().lower() if pg else ""
-                            _qp_words  = set(w for w in re.findall(r"[a-z]{5,}", _qp_pg_txt)
-                                             if w not in {"which","where","their","there","hence",
-                                                          "therefore","question","maximum","minimum",
-                                                          "following","continued","answer"})
-                            _ms_words  = set(re.findall(r"[a-z]{5,}", _ms_pg_txt))
-                            _common    = _qp_words & _ms_words
-                            # Flag if almost NO overlap and both sets are non-trivial
-                            if len(_qp_words) > 10 and len(_ms_words) > 10 and len(_common) < 2:
-                                ms_topic_mismatch = True
-                        except Exception:
-                            pass
-
-                        if not ms_topic_mismatch:
-                            pieces = _crop_ms_pieces(ms_doc, q_info)
-                            if pieces:
-                                ms_imgs = pieces
+                        # Always attempt to crop — segment-level matching already
+                        # ensures QP segment N maps to MS section N (same exam).
+                        # Per-question topic checking is too strict for math PDFs
+                        # (MS pages are almost all symbols/numbers, few words).
+                        pieces = _crop_ms_pieces(ms_doc, q_info)
+                        if pieces:
+                            ms_imgs = pieces
 
                 # sol config
                 n_sol, sol_separate = _sol_config(qp_img)
@@ -1780,15 +1767,7 @@ def build_structured_worksheet(
                 ap.paragraph_format.keep_with_next = True
                 _s_run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
-                if ms_topic_mismatch:
-                    p = doc.add_paragraph()
-                    p.paragraph_format.space_before = Pt(0)
-                    p.paragraph_format.space_after  = Pt(2)
-                    _s_run(p,
-                           "⚠ Mark Scheme answer could not be verified for this question "
-                           "(topic mismatch detected). Please check the MS PDF manually.",
-                           italic=True, size_pt=11, color="CC0000")
-                elif ms_imgs:
+                if ms_imgs:
                     for img in ms_imgs:
                         _s_add_ms_img(doc, img)
                 else:
@@ -2816,4 +2795,3 @@ if st.session_state.get("ws_ready") and st.session_state.get("ws_docx"):
         for _k in ["ws_docx", "ws_missing", "ws_stats", "ws_ready"]:
             st.session_state.pop(_k, None)
         st.rerun()
-
