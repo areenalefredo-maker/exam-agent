@@ -290,11 +290,14 @@ def parse_excel(uploaded_file) -> list[dict]:
         ref = re.sub(r'\boctober\b', 'November', ref, flags=re.IGNORECASE)
         ref = re.sub(r'\boct\b',     'Nov',      ref, flags=re.IGNORECASE)
 
-        _P2_CODES = ('7205', '7210', '7215', '7310', '7315', '7320')
-        if any(code in ref for code in _P2_CODES):
-            continue
-        if re.search(r'\bpaper[\s\-]?2\b|[/\-_](?:h|s)p2[/\-_]', ref, re.IGNORECASE):
-            continue
+        # Paper 2 filter — only applies when caller enables it
+        if getattr(parse_excel, '_filter_paper2', False):
+            _P2_CODES = ('7205', '7210', '7215', '7310', '7315', '7320')
+            if any(code in ref for code in _P2_CODES):
+                continue
+            if re.search(r'\bpaper[\s\-]?2\b|[/\-_](?:h|s)p2[/\-_]', ref, re.IGNORECASE):
+                continue
+
 
         dedup_key = (q_num, ref.strip().lower(), page_num, topic.strip().lower(),
                      difficulty.strip().lower(), marks, quote.strip().lower())
@@ -1999,12 +2002,30 @@ if st.button(
         # ── 1) Excel ──────────────────────────────────────────────────────────
         st.write("📊 Reading Excel (metadata only)…")
         try:
+            parse_excel._filter_paper2 = st.session_state.get("filter_p2", False)
             xl_rows = parse_excel(xl_file)
         except Exception as e:
             st.error(f"Failed to read Excel: {e}")
             st.stop()
         if not xl_rows:
-            st.error("No valid question rows found in Excel.")
+            _fp = st.session_state.get("filter_p2", False)
+            if _fp:
+                st.error(
+                    "❌ No valid question rows found in Excel.\n\n"
+                    "**Most likely reason:** All rows were removed because the "
+                    "Reference column was detected as Paper 2.  \n"
+                    "👉 **Uncheck the 'Skip Paper 2 rows' checkbox** above "
+                    "and click Extract & Generate again."
+                )
+            else:
+                st.error(
+                    "❌ No valid question rows found in Excel.\n\n"
+                    "Please check:\n"
+                    "- Row 1 must be column headers\n"
+                    "- There must be a Question Number column (Q No., Q#, etc.)\n"
+                    "- Question numbers must be integers (1, 2, 3…)\n"
+                    "- If this is a Paper 2 file, uncheck 'Skip Paper 2 rows'"
+                )
             st.stop()
         st.write(f"✅ {len(xl_rows)} question rows in Excel")
 
