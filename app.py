@@ -2189,17 +2189,24 @@ if st.button(
 
             # Apply marks override and filter
             clean_rows = []
+            # Open QP once (avoids re-opening 226 times for marks lookup)
+            try:
+                _qp_doc_shared = fitz.open(stream=qp_bytes, filetype="pdf")
+                _qp_n_pages_shared = len(_qp_doc_shared)
+            except Exception:
+                _qp_doc_shared = None
+                _qp_n_pages_shared = 9999
+
             for i, r in enumerate(xl_rows):
                 pg = r.get("page_num", 0)
                 if pg <= 0:
                     continue
                 r2 = dict(r)
                 # Apply marks from QP if marks=0
-                if r2.get("marks", 0) == 0:
+                if r2.get("marks", 0) == 0 and _qp_doc_shared is not None:
                     try:
-                        _doc_tmp = fitz.open(stream=qp_bytes, filetype="pdf")
-                        _ptxt    = _doc_tmp[pg - 1].get_text() if pg <= len(_doc_tmp) else ""
-                        _doc_tmp.close()
+                        _ptxt = (_qp_doc_shared[pg - 1].get_text()
+                                 if pg <= _qp_n_pages_shared else "")
                         _mm = re.search(r'\[Maximum mark[:\s]+(\d+)\]', _ptxt, re.IGNORECASE)
                         if _mm:
                             r2["marks"] = int(_mm.group(1))
@@ -2208,16 +2215,14 @@ if st.button(
                 if r2.get("marks", 0) == 0:
                     r2["marks"] = 1
                 # Validate / clamp page_num_end against actual PDF length
-            pg_end_raw = r2.get("page_num_end", 0) or 0
-            try:
-                qp_n_pages = len(fitz.open(stream=qp_bytes, filetype="pdf"))
-            except Exception:
-                qp_n_pages = 9999
-            if pg_end_raw > qp_n_pages:
-                r2["page_num_end"] = qp_n_pages
-            elif pg_end_raw < r2.get("page_num", 1):
-                r2["page_num_end"] = r2.get("page_num", 1)
-            clean_rows.append((i, r2))
+                pg_end_raw = r2.get("page_num_end", 0) or 0
+                if pg_end_raw > 0:
+                    _qp_n_pages = _qp_n_pages_shared
+                    if pg_end_raw > _qp_n_pages:
+                        r2["page_num_end"] = _qp_n_pages
+                    elif pg_end_raw < r2.get("page_num", 1):
+                        r2["page_num_end"] = r2.get("page_num", 1)
+                clean_rows.append((i, r2))
 
             # Build questions list for validation display
             questions = []
@@ -2246,6 +2251,11 @@ if st.button(
                     "answerFound":  ans_ok,
                 })
 
+            if _qp_doc_shared is not None:
+                try:
+                    _qp_doc_shared.close()
+                except Exception:
+                    pass
             xl_rows_clean = [r2 for (i, r2) in clean_rows]
 
         else:
