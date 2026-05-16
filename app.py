@@ -868,7 +868,48 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
         # Store max_qn for matching heuristic
         sec["max_qn"] = max(sec["questions"].keys()) if sec["questions"] else 0
 
-    sections = [s for s in sections if len(s["questions"]) >= 5]
+    # ── Merge Paper 2 sub-sections (Section A Q1-5 + Section B Q6-10) ───────────
+    # IB Paper 2 MS PDFs sometimes split each exam into two sub-sections:
+    #   Sub-section 1 (Q6-10, "Section B") and Sub-section 2 (Q1-5, "Section A")
+    # These must be merged into one combined section per exam so that all
+    # questions (Q1-10) are available for matching.
+    merged_secs = []
+    i = 0
+    while i < len(sections):
+        sec = sections[i]
+        # Check if next section is a "small" companion (max_qn ≤ 6, same exam)
+        if i + 1 < len(sections):
+            nxt = sections[i + 1]
+            # Merge when: this section has high max_qn AND next has low max_qn
+            # (or vice-versa) — they are two halves of the same exam
+            this_mq = sec.get("max_qn", 0)
+            nxt_mq  = nxt.get("max_qn", 0)
+            should_merge = (
+                (this_mq >= 6 and nxt_mq <= 6) or
+                (nxt_mq  >= 6 and this_mq <= 6)
+            )
+            if should_merge:
+                combined_questions = {}
+                combined_questions.update(sec.get("questions", {}))
+                combined_questions.update(nxt.get("questions", {}))
+                combined = {
+                    "questions":  combined_questions,
+                    "start_page": sec.get("start_page", sec.get("start_pi", 0) + 1),
+                    "end_page":   nxt.get("end_page",   nxt.get("start_pi", 0) + 1),
+                    "max_qn":     max(this_mq, nxt_mq),
+                    "paper_code": sec.get("paper_code") or nxt.get("paper_code"),
+                }
+                merged_secs.append(combined)
+                i += 2
+                continue
+        merged_secs.append(sec)
+        i += 1
+
+    # Use merged list if it produced a significantly different count
+    if len(merged_secs) != len(sections):
+        sections = merged_secs
+
+    sections = [s for s in sections if len(s["questions"]) >= 3]
 
     instr_pat = re.compile(
         r"(instructions to examiners|abbreviations|marks? awarded for|"
@@ -877,15 +918,24 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     )
     try:
         doc2 = fitz.open(stream=ms_bytes, filetype="pdf")
+        # Answer-content markers (M1, A1, R1, etc.)
+        answer_marker_pat = re.compile(r"\b(M1|A1|A2|A3|R1|M0|AG|FT|ft)\b")
         filtered = []
         for s in sections:
             start = s["start_page"] - 1
-            instr_score = 0
-            for pi in range(start, min(start + 2, len(doc2))):
+            # A section is an instruction-only section (no real answers)
+            # when its first page has instructions but NO answer markers
+            # (P2 MS puts instructions + answers on the same page, so we
+            #  must check for the presence of answer markers to distinguish)
+            is_instr_only = False
+            for pi in range(start, min(start + 1, len(doc2))):
                 txt = doc2[pi].get_text()
-                if instr_pat.search(txt):
-                    instr_score += 1
-            if instr_score == 0:
+                has_instr   = bool(instr_pat.search(txt))
+                has_answers = bool(answer_marker_pat.search(txt))
+                # Only filter if it's a pure instructions page (no answer markers)
+                if has_instr and not has_answers:
+                    is_instr_only = True
+            if not is_instr_only:
                 filtered.append(s)
         doc2.close()
         sections = filtered
@@ -928,6 +978,28 @@ def _s_trim_bottom(img, thr=248):
     if len(dk) == 0:
         return img
     return img.crop((0, 0, img.width, min(int(dk[-1]) + 10, img.height)))
+
+
+def _s_whiteout(img, rects_pt, origin_pt=(0.0, 0.0)):
+    """Paint white rectangles over specified PDF-coordinate regions.
+
+    img        : PIL Image (already cropped from the PDF page).
+    rects_pt   : list of (x0, y0, x1, y1) in PDF point coordinates.
+    origin_pt  : (x_pt, y_pt) of the top-left corner of the crop in PDF space.
+    """
+    from PIL import ImageDraw
+    img  = img.copy()
+    draw = ImageDraw.Draw(img)
+    ox, oy = origin_pt
+    for (x0, y0, x1, y1) in rects_pt:
+        draw.rectangle([
+            max(0, int((x0 - ox) * _S_SCALE) - 1),
+            max(0, int((y0 - oy) * _S_SCALE) - 1),
+            int((x1 - ox) * _S_SCALE) + 2,
+            int((y1 - oy) * _S_SCALE) + 2,
+        ], fill="white")
+    del draw
+    return img
 
 
 def _s_split_smart(img, max_h=1500, thr=250, win=250):
@@ -1145,6 +1217,28 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
     clip = fitz.Rect(X_LEFT, cs, X_RIGHT, ce)
     pix  = page.get_pixmap(matrix=fitz.Matrix(_S_SCALE, _S_SCALE), clip=clip, alpha=False)
     img  = Image.open(io.BytesIO(pix.tobytes("png")))
+
+    # Strip the original question number marker ("N.") from the image
+    # while keeping "[Maximum mark: ...]" which is on the same line but further right.
+    # Locate the q-marker span via text extraction and white it out.
+    if not is_cont:
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    stxt = span.get("text", "").strip()
+                    sbb  = span.get("bbox", [0, 0, 0, 0])
+                    # Match "N." or "N " at far-left (x < 60pt), same y as cs
+                    if (re.match(r"^\d{1,2}[.\s]?$", stxt)
+                            and sbb[0] < 60
+                            and abs(sbb[1] - qt) < 20 if qt is not None else sbb[1] < cs + 20):
+                        img = _s_whiteout(
+                            img,
+                            [(sbb[0], sbb[1], sbb[2] + 4, sbb[3] + 2)],
+                            origin_pt=(X_LEFT, cs),
+                        )
+
     return img, has_cont
 
 
@@ -1290,13 +1384,16 @@ def _crop_ms_pieces(ms_doc, q_info):
         iw, ih = img.size
         ft = _ms_ft_top(pg)
         pb = max(ph * 0.5, ft - 6)
-        rx = iw - int(pw * 0.06 * _S_SCALE)
-        lx = max(0, int((mrx + 6) * _S_SCALE)) if (pi == spi and mrx) else int(pw * 0.04 * _S_SCALE)
+        # FIX: use full page width minus tiny 8px margin so marks at x=97% are visible
+        rx = iw - 8
+        lx = 0  # always start from left edge to keep question-part labels
         hb = _ms_hdr_bot(pg)
         pt = max(ph * 0.06, hb + 6) if hb else ph * 0.06
         if pi == spi == epi:
             ty = sy
-            by = min(ey, pb)
+            # Track last real content line to avoid cutting off Total/marks
+            lc_e = _last_ms_y(pg, sy, pb)
+            by   = min(max(ey, lc_e + 10), pb)
         elif pi == spi:
             ty = sy
             lc = _last_ms_y(pg, sy, pb)
@@ -1304,17 +1401,35 @@ def _crop_ms_pieces(ms_doc, q_info):
         elif pi == epi:
             ty = pt
             lc2 = _last_ms_y(pg, pt, min(ey, pb))
-            by = min(lc2 + 10, ey, pb)
+            by  = min(max(lc2 + 10, ey), pb)
         else:
             ty = pt
             lc3 = _last_ms_y(pg, pt, pb)
-            by = min(lc3 + 10, pb)
+            by  = min(lc3 + 10, pb)
         tp = max(0, int(ty * _S_SCALE) - 6)
-        bp = min(ih, int(by * _S_SCALE) + 6)
+        bp = min(ih, int(by * _S_SCALE) + 8)    # +8 for a little extra bottom padding
         if bp > tp + 20 and rx > lx:
             piece = img.crop((lx, tp, rx, bp))
             piece = _s_trim_bottom(piece)
             if piece.height > 10:
+                # Strip "N." question number marker from the first piece
+                if pi == spi:
+                    for block in pg.get_text("dict").get("blocks", []):
+                        if block.get("type") != 0:
+                            continue
+                        for line in block.get("lines", []):
+                            for span in line.get("spans", []):
+                                stxt = span.get("text", "").strip()
+                                sbb  = span.get("bbox", [0, 0, 0, 0])
+                                if (re.match(r"^\d{1,2}[.\s]?$", stxt)
+                                        and sbb[0] < 60
+                                        and sbb[1] >= ty - 4
+                                        and sbb[1] < ty + 30):
+                                    piece = _s_whiteout(
+                                        piece,
+                                        [(sbb[0], sbb[1], sbb[2] + 4, sbb[3] + 2)],
+                                        origin_pt=(lx / _S_SCALE, tp / _S_SCALE),
+                                    )
                 final.extend(_s_split_smart(piece, 1500))
     return final if final else None
 
@@ -1529,15 +1644,33 @@ def build_structured_worksheet(
                 pg_end = r.get("page_num_end", 0) or 0
                 qp_img = _crop_qp_full(qp_doc, pg, qn, pg_end=pg_end)
 
-                # Crop MS
+                # Crop MS — with topic-coherence check
                 sec     = row_to_section.get(ri)
                 ms_imgs = []
+                ms_topic_mismatch = False
                 if sec and isinstance(sec, dict):
                     q_info = sec.get("questions", {}).get(qn)
                     if q_info:
-                        pieces = _crop_ms_pieces(ms_doc, q_info)
-                        if pieces:
-                            ms_imgs = pieces
+                        # Quick coherence check: does MS page mention any QP keywords?
+                        try:
+                            _ms_pg_txt = ms_doc[q_info["page_idx"]].get_text().lower()
+                            _qp_pg_txt = qp_doc[max(0, pg-1)].get_text().lower() if pg else ""
+                            _qp_words  = set(w for w in re.findall(r"[a-z]{5,}", _qp_pg_txt)
+                                             if w not in {"which","where","their","there","hence",
+                                                          "therefore","question","maximum","minimum",
+                                                          "following","continued","answer"})
+                            _ms_words  = set(re.findall(r"[a-z]{5,}", _ms_pg_txt))
+                            _common    = _qp_words & _ms_words
+                            # Flag if almost NO overlap and both sets are non-trivial
+                            if len(_qp_words) > 10 and len(_ms_words) > 10 and len(_common) < 2:
+                                ms_topic_mismatch = True
+                        except Exception:
+                            pass
+
+                        if not ms_topic_mismatch:
+                            pieces = _crop_ms_pieces(ms_doc, q_info)
+                            if pieces:
+                                ms_imgs = pieces
 
                 # sol config
                 n_sol, sol_separate = _sol_config(qp_img)
@@ -1647,7 +1780,15 @@ def build_structured_worksheet(
                 ap.paragraph_format.keep_with_next = True
                 _s_run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
-                if ms_imgs:
+                if ms_topic_mismatch:
+                    p = doc.add_paragraph()
+                    p.paragraph_format.space_before = Pt(0)
+                    p.paragraph_format.space_after  = Pt(2)
+                    _s_run(p,
+                           "⚠ Mark Scheme answer could not be verified for this question "
+                           "(topic mismatch detected). Please check the MS PDF manually.",
+                           italic=True, size_pt=11, color="CC0000")
+                elif ms_imgs:
                     for img in ms_imgs:
                         _s_add_ms_img(doc, img)
                 else:
@@ -2196,65 +2337,150 @@ if st.button(
         if n_ms == n_segs:
             # Perfect count match → direct positional
             compatible_ms = list(enumerate(ms_sections))
-            match_method  = "Direct positional"
+            match_method  = "Direct positional (1:1)"
 
         elif n_ms > n_segs:
-            # MS has more sections than Excel segments
-            # Try every-k-th alternation for k = n_ms // n_segs
-            k = n_ms // n_segs
+            # MS has more sections than Excel segments.
+            # Try multiple k values to find the best alternation pattern.
+            # Includes k=2 even when floor(n_ms/n_segs)=1 but ratio≈2
+            # (handles P2: 34 MS sections, 18 Excel segments).
+            ratio = n_ms / n_segs
+            k_candidates = set()
+            k_candidates.add(n_ms // n_segs)             # floor ratio
+            if n_ms // n_segs == 0:
+                k_candidates.add(1)
+            if ratio >= 1.5:                              # ratio close to 2
+                k_candidates.add(2)
+            if ratio >= 2.5:                              # ratio close to 3
+                k_candidates.add(3)
+            k_candidates = sorted(k_candidates)           # try smallest first
+
             best_alt  = None
             best_diff = float("inf")
+            best_k    = 1
 
-            for start in range(k):
-                alt = [(i, ms_sections[i])
-                       for i in range(start, n_ms, k)
-                       if i < n_ms]
-                if len(alt) < n_segs:
-                    continue
-                alt = alt[:n_segs]
-                avg_max_qn = sum(_ms_max_qn(s) for _, s in alt) / len(alt)
-                diff = abs(avg_max_qn - overall_excel_max_qn)
-                if diff < best_diff:
-                    best_diff = diff
-                    best_alt  = alt
+            for k in k_candidates:
+                if k == 0:
+                    k = 1
+                for start in range(k):
+                    alt = [(i, ms_sections[i])
+                           for i in range(start, n_ms, k)
+                           if i < n_ms]
+                    # Allow ±1 slack to handle uneven sections (e.g. 34 sections, 18 needed)
+                    if len(alt) < n_segs - 1:
+                        continue
+                    alt_use = alt[:n_segs]   # may be 1 short — padded below
+                    avg_max_qn = sum(_ms_max_qn(s) for _, s in alt_use) / len(alt_use)
+                    diff = abs(avg_max_qn - overall_excel_max_qn)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_alt  = alt_use
+                        best_k    = k
 
-            if best_alt and len(best_alt) >= n_segs:
+            if best_alt and len(best_alt) >= n_segs - 1:
+                # If 1 short, extend with the nearest unused section
+                if len(best_alt) < n_segs:
+                    used_indices = {i for i, _ in best_alt}
+                    for i, s in enumerate(ms_sections):
+                        if i not in used_indices:
+                            best_alt = list(best_alt) + [(i, s)]
+                            break
                 compatible_ms = best_alt[:n_segs]
-                match_method  = f"Every-{k}-th alternation (start={compatible_ms[0][0]}, avg_max_qn={sum(_ms_max_qn(s) for _,s in compatible_ms)/len(compatible_ms):.1f})"
+                avg_sel = sum(_ms_max_qn(s) for _, s in compatible_ms) / len(compatible_ms)
+                match_method  = (f"Alternation k={best_k} start={compatible_ms[0][0]} "
+                                 f"(avg_max_qn={avg_sel:.1f} vs excel={overall_excel_max_qn})")
             else:
-                # Alternation didn't work → filter by max_qn proximity
-                threshold = max(overall_excel_max_qn - 3, 8)
-                compatible_ms = [
-                    (i, s) for i, s in enumerate(ms_sections)
-                    if _ms_max_qn(s) >= threshold
-                ][:n_segs]
-                match_method  = f"Threshold filter (max_qn>={threshold})"
+                # Alternation didn't give enough → filter by max_qn proximity
+                threshold = max(overall_excel_max_qn - 3, 3)
+                compatible_ms = sorted(
+                    [(i, s) for i, s in enumerate(ms_sections)
+                     if abs(_ms_max_qn(s) - overall_excel_max_qn) <= 4],
+                    key=lambda x: abs(_ms_max_qn(x[1]) - overall_excel_max_qn)
+                )[:n_segs]
+                match_method  = f"Proximity filter (excel_max_qn={overall_excel_max_qn})"
 
             if len(compatible_ms) < n_segs:
-                # Last resort: take the last n_segs sections
+                # Last resort
                 compatible_ms = list(enumerate(ms_sections))[-n_segs:]
                 match_method  += " [last-resort fallback]"
 
         else:
             # n_ms < n_segs — fewer MS sections than segments
             compatible_ms = list(enumerate(ms_sections))
-            match_method  = f"Partial ({n_ms} MS < {n_segs} Excel segs)"
+            match_method  = f"Partial ({n_ms} MS < {n_segs} Excel segs — some MS answers missing)"
 
         # ── Positional mapping within compatible MS sections ──────────────────────
         seg_paper_codes    = [None] * n_segs
         mismatch_warnings  = []
 
+        # ── Content-based sanity check helpers ────────────────────────────────────
+        def _qp_segment_keywords(seg_rows_, qp_bytes_):
+            """Extract keywords from first QP question in this segment."""
+            try:
+                _doc = fitz.open(stream=qp_bytes_, filetype="pdf")
+                words = set()
+                for ri in seg_rows_[:3]:   # check first 3 rows
+                    pg  = xl_rows[ri].get("page_num", 0)
+                    if pg and pg <= len(_doc):
+                        txt = _doc[pg - 1].get_text().lower()
+                        # Extract meaningful words (4+ chars, alpha only)
+                        words.update(w for w in re.findall(r"[a-z]{4,}", txt)
+                                     if w not in _STOP_WORDS)
+                _doc.close()
+                return words
+            except Exception:
+                return set()
+
+        def _ms_section_keywords(sec_):
+            """Extract keywords from first MS question in this section."""
+            try:
+                _doc = fitz.open(stream=ms_bytes, filetype="pdf")
+                words = set()
+                for qn_key in sorted(sec_.get("questions", {}).keys())[:2]:
+                    q_info_ = sec_["questions"][qn_key]
+                    pi_     = q_info_.get("page_idx", 0)
+                    if pi_ < len(_doc):
+                        txt = _doc[pi_].get_text().lower()
+                        words.update(w for w in re.findall(r"[a-z]{4,}", txt)
+                                     if w not in _STOP_WORDS)
+                _doc.close()
+                return words
+            except Exception:
+                return set()
+
+        _STOP_WORDS = {
+            "that", "this", "with", "from", "have", "will", "your", "each",
+            "note", "award", "mark", "where", "when", "show", "find", "hence",
+            "answer", "correct", "given", "value", "total", "marks", "method",
+            "following", "question", "continued", "maximum", "minimum",
+            "which", "then", "also", "both", "such", "their", "there",
+        }
+
         for pos, seg_idx in enumerate(sorted_seg_indices):
             seg_rows = segments[seg_idx]
             if pos < len(compatible_ms):
                 orig_ms_idx, sec = compatible_ms[pos]
-                # Sanity check: max_qn of MS section should be ≥ segment's max_qn
+                # Sanity check 1: max_qn difference
                 seg_mq = seg_max_qns[seg_idx]
                 ms_mq  = _ms_max_qn(sec)
-                if ms_mq > 0 and abs(ms_mq - seg_mq) > 3:
+                qn_diff = abs(ms_mq - seg_mq) if ms_mq > 0 else 0
+
+                # Sanity check 2: keyword overlap (content-based)
+                overlap_ok = True
+                overlap_ratio = 1.0
+                if is_structured and qn_diff <= 3:
+                    qp_kws = _qp_segment_keywords(seg_rows, qp_bytes)
+                    ms_kws = _ms_section_keywords(sec)
+                    if qp_kws and ms_kws:
+                        common = qp_kws & ms_kws
+                        overlap_ratio = len(common) / max(len(qp_kws & ms_kws | (qp_kws & ms_kws)), 1)
+                        # Require at least 3 shared content words
+                        overlap_ok = len(common) >= 3
+
+                if qn_diff > 3:
                     mismatch_warnings.append(
-                        f"Seg{seg_idx+1}(max_q={seg_mq}) ↔ MSsec{orig_ms_idx+1}(max_q={ms_mq}) "
-                        f"— difference={abs(ms_mq-seg_mq)}"
+                        f"Seg{seg_idx+1}(max_q={seg_mq}) ↔ MSsec{orig_ms_idx+1}(max_q={ms_mq}): "
+                        f"question count mismatch (diff={qn_diff})"
                     )
             else:
                 orig_ms_idx, sec = -1, None
@@ -2590,3 +2816,4 @@ if st.session_state.get("ws_ready") and st.session_state.get("ws_docx"):
         for _k in ["ws_docx", "ws_missing", "ws_stats", "ws_ready"]:
             st.session_state.pop(_k, None)
         st.rerun()
+
