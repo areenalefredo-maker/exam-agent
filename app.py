@@ -865,6 +865,8 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
         last_qn, last_pi, _ = order[-1]
         sec["end_page"] = sec["questions"][last_qn]["end_page_idx"] + 1
         sec.pop("_order", None)
+        # Store max_qn for matching heuristic
+        sec["max_qn"] = max(sec["questions"].keys()) if sec["questions"] else 0
 
     sections = [s for s in sections if len(s["questions"]) >= 5]
 
@@ -2122,7 +2124,22 @@ if st.button(
         segments = excel_segments
         st.write(f"📚 Using {len(segments)} paper segment(s)")
 
-        # ── 4) Row → MS section mapping (PURE POSITIONAL) ─────────────────────
+        # ── 4) Row → MS section mapping ──────────────────────────────────────────
+        #
+        # Problem: MS PDFs for IB Math typically contain BOTH SL and HL sections
+        # interleaved (SL section, then HL section, for each exam session).
+        # Excel rows are HL-only (or a single paper type).
+        # Pure positional mapping therefore pairs the wrong sections.
+        #
+        # Fix strategy:
+        #   1. Determine the max question number per Excel segment (= paper type).
+        #   2. Filter MS sections to only those whose max question number is
+        #      "compatible" (within ±2) with the Excel segment max_qn.
+        #   3. When counts differ (MS has SL+HL, Excel has HL only), pick only
+        #      the compatible subset and map positionally within that subset.
+        #   4. Fallback: if counts match exactly, use standard positional mapping.
+        # ─────────────────────────────────────────────────────────────────────────
+
         row_to_section     = {}
         row_to_section_idx = {}
 
@@ -2131,14 +2148,56 @@ if st.button(
                    if xl_rows[ri].get("page_num", 0) > 0]
             return min(pgs) if pgs else 999999
 
+        def _seg_max_qn(seg_rows_):
+            return max((xl_rows[ri].get("qn", 0) for ri in seg_rows_), default=0)
+
         sorted_seg_indices = sorted(range(len(segments)), key=lambda i: _seg_min_page(segments[i]))
 
-        seg_paper_codes = [None] * len(segments)
+        # Compute max_qn for each segment (= highest question number in that segment)
+        seg_max_qns = [_seg_max_qn(segments[si]) for si in range(len(segments))]
+        overall_excel_max_qn = max(seg_max_qns) if seg_max_qns else 13
 
+        # ── Filter MS sections that are compatible with the Excel paper type ─────
+        # Compatible = max question number within ±3 of the Excel segment max qn,
+        # OR if the MS section covers more questions than the SL counterpart.
+        # When the MS has twice as many sections as Excel segments (SL+HL combined),
+        # pick only the sections whose max_qn >= (overall_excel_max_qn - 2).
+        n_segs = len(segments)
+        n_ms   = len(ms_sections)
+
+        if n_ms >= 2 * n_segs:
+            # MS has ~2× sections → contains both SL and HL (or TZ1+TZ2 with different counts)
+            # Keep only the sections compatible with Excel's question count
+            threshold = max(overall_excel_max_qn - 2, 10)
+            compatible_ms = [
+                (orig_idx, sec)
+                for orig_idx, sec in enumerate(ms_sections)
+                if isinstance(sec, dict) and sec.get("max_qn", len(sec.get("questions", {}))) >= threshold
+            ]
+            # Fallback: if that still doesn't give enough, use every other section
+            if len(compatible_ms) < n_segs:
+                # Take every second section starting from index 1 (the HL one in each pair)
+                compatible_ms = [
+                    (orig_idx, sec)
+                    for orig_idx, sec in enumerate(ms_sections)
+                    if orig_idx % 2 == 1
+                ]
+            # If still not enough, fall back to all sections
+            if len(compatible_ms) < n_segs:
+                compatible_ms = list(enumerate(ms_sections))
+        else:
+            # MS count roughly matches Excel segments → use all sections
+            compatible_ms = list(enumerate(ms_sections))
+
+        # ── Positional mapping within compatible MS sections ──────────────────────
+        seg_paper_codes = [None] * len(segments)
         for pos, seg_idx in enumerate(sorted_seg_indices):
             seg_rows = segments[seg_idx]
-            sec      = ms_sections[pos] if pos < len(ms_sections) else None
-            ms_idx   = pos              if pos < len(ms_sections) else -1
+            if pos < len(compatible_ms):
+                orig_ms_idx, sec = compatible_ms[pos]
+            else:
+                orig_ms_idx, sec = -1, None
+            ms_idx = orig_ms_idx
             for ri in seg_rows:
                 row_to_section[ri]     = sec
                 row_to_section_idx[ri] = ms_idx
@@ -2167,7 +2226,7 @@ if st.button(
                     "Excel Ref":   ref_str[:40],
                     "MS section#": ms_sec_i + 1 if ms_sec_i >= 0 else "—",
                     "MS code":     ms_code or "—",
-                    "Method":      "Positional",
+                    "Method":      "HL-filtered" if n_ms >= 2 * n_segs else "Positional",
                     "Questions":   len(seg_rows),
                     "MS Qs avail": len(ms_sec.get("questions", {})) if ms_sec else 0,
                 })
