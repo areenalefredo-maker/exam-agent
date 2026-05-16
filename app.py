@@ -1499,7 +1499,7 @@ def build_structured_worksheet(
     total_qs = len(xl_rows)
     done_qs  = 0
     first    = True
-    ws_q     = 0
+    ws_q     = 0      # per-chapter counter (resets each new chapter)
     cur_t    = None
     cur_d    = None
 
@@ -1513,7 +1513,6 @@ def build_structured_worksheet(
         for diff in sorted_diffs:
             ri_list = diffs[diff]
             for ri in ri_list:
-                ws_q += 1
                 r    = xl_rows[ri]
                 pg   = r.get("page_num", 0)
                 qn   = r.get("qn", 0)
@@ -1553,6 +1552,7 @@ def build_structured_worksheet(
                     _s_run(h, topic, bold=True, size_pt=20)
                     cur_t = topic
                     cur_d = None
+                    ws_q  = 0   # ← reset per-chapter counter
 
                 if diff != cur_d:
                     dp = doc.add_paragraph()
@@ -1562,6 +1562,7 @@ def build_structured_worksheet(
                     cur_d = diff
 
                 # ── Question header (ONE page break per question) ──────────
+                ws_q += 1   # increment after possible chapter reset
                 qh = doc.add_paragraph()
                 if not first:
                     qh.paragraph_format.page_break_before = True
@@ -1589,22 +1590,46 @@ def build_structured_worksheet(
                 _s_run(cp, f" :  {topic}", size_pt=11)
                 _s_hr(doc, "BFBFBF")
 
-                # ── QP image ──────────────────────────────────────────────
+                # ── QP image (split across pages if too tall) ─────────────
+                # Safe page height for a QP image (content height minus header)
+                _QP_MAX_H    = 1400   # px at 150dpi  ≈ 504pt  → leaves room for header
+                _QP_SAFE_1ST = 900    # px — max for the first piece (header takes space)
+
                 if qp_img:
-                    _s_add_img(doc, qp_img)
+                    qp_h = qp_img.height
+                    qp_w = qp_img.width
+
+                    if qp_h <= _QP_MAX_H:
+                        # Fits on one page as usual
+                        _s_add_img(doc, qp_img)
+                        _qp_pieces_used = 1
+                    else:
+                        # Split at natural white-space boundaries
+                        qp_pieces = _s_split_smart(qp_img, max_h=_QP_SAFE_1ST)
+                        for pi_idx, qp_piece in enumerate(qp_pieces):
+                            if pi_idx > 0:
+                                # Each extra piece gets its own page
+                                _pb_qp = doc.add_paragraph()
+                                _pb_qp.paragraph_format.page_break_before = True
+                                _pb_qp.paragraph_format.space_before = Pt(0)
+                                _pb_qp.paragraph_format.space_after  = Pt(0)
+                            _s_add_img(doc, qp_piece)
+                        _qp_pieces_used = len(qp_pieces)
                 else:
                     p = doc.add_paragraph()
                     _s_run(p, "[Question image not available]", italic=True, size_pt=11)
+                    _qp_pieces_used = 0
 
                 # ── Student's Solution ────────────────────────────────────
-                if sol_separate:
+                # Always on a fresh page when image was split
+                if sol_separate or (qp_img and qp_img.height > _QP_MAX_H):
                     pb2 = doc.add_paragraph()
                     pb2.paragraph_format.page_break_before = True
                     pb2.paragraph_format.space_before = Pt(0)
                     pb2.paragraph_format.space_after  = Pt(0)
 
                 sl = doc.add_paragraph()
-                sl.paragraph_format.space_before = Pt(0 if sol_separate else 8)
+                sl.paragraph_format.space_before = Pt(0 if (sol_separate or (qp_img and qp_img.height > _QP_MAX_H)) else 8)
                 sl.paragraph_format.space_after  = Pt(4)
                 sl.paragraph_format.keep_with_next = True
                 _s_run(sl, "Student's Solution:", bold=True, size_pt=11)
