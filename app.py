@@ -2349,7 +2349,7 @@ if st.button(
             _qp_tmp = fitz.open(stream=qp_bytes, filetype="pdf")
             for _pi in range(len(_qp_tmp)):
                 _pg_txt = _qp_tmp[_pi].get_text()
-                if re.search(r"1[.]\s{0,5}\[Maximum mark", _pg_txt):
+                if re.search(r"1[.][\s\x07]*\[Maximum mark", _pg_txt):
                     qp_session_starts.append(_pi + 1)   # 1-based page number
             _qp_tmp.close()
         except Exception:
