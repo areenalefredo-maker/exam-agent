@@ -1776,9 +1776,21 @@ def build_structured_worksheet(
                 ms_topic_mismatch = False   # kept for display logic below
                 if sec and isinstance(sec, dict):
                     q_info = sec.get("questions", {}).get(qn)
-                    # Fallback: scan section pages directly if Q marker wasn't detected
+                    # Fallback 1: scan section pages for the question marker
                     if q_info is None:
                         q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+                    # Fallback 2: use entire section content (guarantees no unmatched row)
+                    if q_info is None and sec.get("questions"):
+                        qs_sorted = sorted(sec["questions"].keys())
+                        first_q   = sec["questions"][qs_sorted[0]]
+                        last_q    = sec["questions"][qs_sorted[-1]]
+                        q_info = {
+                            "page_idx":       first_q["page_idx"],
+                            "top_y":          first_q["top_y"],
+                            "end_page_idx":   last_q.get("end_page_idx", last_q["page_idx"]),
+                            "end_y":          last_q.get("end_y", last_q.get("bottom_y", 700)),
+                            "marker_right_x": 0,
+                        }
                     if q_info:
                         pieces = _crop_ms_pieces(ms_doc, q_info)
                         if pieces:
@@ -2744,6 +2756,18 @@ if st.button(
                 q_info  = (sec.get("questions", {}).get(qn) if sec and "questions" in sec else None)
                 if q_info is None and sec and isinstance(sec, dict):
                     q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+                # Fallback: use entire section if specific Q not found
+                if q_info is None and sec and isinstance(sec, dict) and sec.get("questions"):
+                    qs_s = sorted(sec["questions"].keys())
+                    fq   = sec["questions"][qs_s[0]]
+                    lq   = sec["questions"][qs_s[-1]]
+                    q_info = {
+                        "page_idx":      fq["page_idx"],
+                        "top_y":         fq["top_y"],
+                        "end_page_idx":  lq.get("end_page_idx", lq["page_idx"]),
+                        "end_y":         lq.get("end_y", lq.get("bottom_y", 700)),
+                        "marker_right_x": 0,
+                    }
                 ms_img  = None   # will crop during word build
                 ans_ok  = q_info is not None
                 questions.append({
