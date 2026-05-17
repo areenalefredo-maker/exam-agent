@@ -1010,6 +1010,19 @@ _MS_INSTR_PAT  = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 
+# QP cover/instruction page detector (for skipping non-question pages in QP PDF)
+# These phrases appear on exam cover pages — never crop them as question content.
+_QP_INSTR_PAT = re.compile(
+    r"instructions to candidates|"
+    r"do not open this examination|"
+    r"graphic display calculator is required|"
+    r"answer all the questions in the answer booklet|"
+    r"maximum mark for this examination|"
+    r"formula booklet is required|"
+    r"answer booklet provided",
+    re.IGNORECASE
+)
+
 _S_FOOTER_PAT  = re.compile(
     r"(M\d{2}/\d|N\d{2}/\d|\d{4}EP\d+|©\s*\d{4}|\bTurn over\b|\bPlease do not\b|"
     r"international\s+baccalaureate|\d{4}[\s\-–]+\d{4})", re.I)
@@ -2331,13 +2344,6 @@ if st.button(
         # Detect exam session start pages from QP PDF (pages with Q1 [Maximum mark]).
         # Then assign each Excel row to its session by QP page number.
         # This guarantees: Excel segment N = QP session N = MS section N (positional).
-        _QP_INSTR_PAT_LOCAL = re.compile(
-            r"instructions to candidates|do not open this examination|"
-            r"graphic display calculator is required|"
-            r"answer all the questions in the answer booklet",
-            re.IGNORECASE
-        )
-
         qp_session_starts: list[int] = []   # QP page numbers (1-based) where each exam starts
         try:
             _qp_tmp = fitz.open(stream=qp_bytes, filetype="pdf")
