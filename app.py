@@ -1424,6 +1424,56 @@ def _last_ms_y(pg, top, hard):
     return last
 
 
+def _find_q_in_section_pages(ms_doc, sec, qn):
+    """
+    Strict fallback: scan section pages for a bold/left-margin question marker.
+    Only matches "N." or "N. (a)" at x<70pt — avoids false positives.
+    Returns a minimal q_info dict if found, else None.
+    """
+    qs_sorted    = sorted(sec.get("questions", {}).keys())
+    sec_start_pi = sec.get("start_pg", 1) - 1
+    if qs_sorted:
+        last_pi = sec["questions"][qs_sorted[-1]]
+        end_pi  = last_pi + 10
+    else:
+        end_pi  = sec_start_pi + 25
+
+    _ps = re.compile(r"^(\d{1,2})\.\s*$")
+    _pq = re.compile(r"^(\d{1,2})\.\s+\(?\w")
+    _pp = re.compile(r"^Q(\d{1,2})\.\s*(?:\(?\w|$)")
+
+    for pi in range(sec_start_pi, min(end_pi, len(ms_doc))):
+        page = ms_doc[pi]
+        if _MS_INSTR_PAT.search(page.get_text()):
+            continue
+        ph = page.rect.height
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans    = line.get("spans", [])
+                full     = "".join(s.get("text", "") for s in spans).strip()
+                bb       = line["bbox"]
+                if bb[0] > 70 or bb[1] > ph * 0.85:
+                    continue
+                qn_found = None
+                m = _ps.match(full) or _pq.match(full)
+                if m:
+                    qn_found = int(m.group(1))
+                else:
+                    mq = _pp.match(full)
+                    if mq:
+                        qn_found = int(mq.group(1))
+                if qn_found == qn:
+                    return {
+                        "page_idx":       pi,
+                        "top_y":          bb[1],
+                        "end_page_idx":   pi,
+                        "end_y":          ph * 0.92,
+                        "marker_right_x": bb[2],
+                    }
+    return None
+
 def _crop_ms_pieces(ms_doc, q_info):
     spi = q_info["page_idx"]
     epi = q_info.get("end_page_idx", spi)
@@ -1713,11 +1763,10 @@ def build_structured_worksheet(
                 ms_topic_mismatch = False   # kept for display logic below
                 if sec and isinstance(sec, dict):
                     q_info = sec.get("questions", {}).get(qn)
+                    # Fallback: scan section pages directly if Q marker wasn't detected
+                    if q_info is None:
+                        q_info = _find_q_in_section_pages(ms_doc, sec, qn)
                     if q_info:
-                        # Always attempt to crop — segment-level matching already
-                        # ensures QP segment N maps to MS section N (same exam).
-                        # Per-question topic checking is too strict for math PDFs
-                        # (MS pages are almost all symbols/numbers, few words).
                         pieces = _crop_ms_pieces(ms_doc, q_info)
                         if pieces:
                             ms_imgs = pieces
@@ -2687,6 +2736,8 @@ if st.button(
                 sec_idx = row_to_section_idx.get(i, -1)
                 qn      = r2["qn"]
                 q_info  = (sec.get("questions", {}).get(qn) if sec and "questions" in sec else None)
+                if q_info is None and sec and isinstance(sec, dict):
+                    q_info = _find_q_in_section_pages(ms_doc, sec, qn)
                 ms_img  = None   # will crop during word build
                 ans_ok  = q_info is not None
                 questions.append({
