@@ -2382,18 +2382,20 @@ if st.button(
             return idx_
 
         if qp_session_starts:
-            # Group Excel rows by their QP session
+            # Group Excel rows by their QP session index
             session_buckets: dict[int, list[int]] = {}
             for i, r in enumerate(xl_rows):
-                pg = r.get("page_num", 0) or 0
+                pg   = r.get("page_num", 0) or 0
                 sidx = _row_session_idx(pg)
                 session_buckets.setdefault(sidx, []).append(i)
             # Build excel_segments in QP session order
-            excel_segments = [
-                session_buckets[k]
-                for k in sorted(session_buckets.keys())
-                if session_buckets[k]
-            ]
+            # Also store qp_session_idx for each segment (for direct MS lookup)
+            excel_segments    = []
+            segment_qp_sidx   = []   # parallel list: segment[i] → QP session index
+            for k in sorted(session_buckets.keys()):
+                if session_buckets[k]:
+                    excel_segments.append(session_buckets[k])
+                    segment_qp_sidx.append(k)
             st.write(f"✅ Segments built from QP PDF: {len(excel_segments)} session(s) "
                      f"from {len(qp_session_starts)} QP exam boundaries")
         else:
@@ -2423,6 +2425,7 @@ if st.button(
                 seg_ref = ref
             if cur_seg:
                 excel_segments.append(cur_seg)
+            segment_qp_sidx = list(range(len(excel_segments)))   # fallback: positional
             st.warning("⚠ Could not detect QP session boundaries — using ref-based segments")
 
         seg_offsets = infer_segment_page_offsets(locations, xl_rows, excel_segments)
@@ -2451,208 +2454,57 @@ if st.button(
             st.write(f"✅ Found {len(ms_sections)} answer section(s)")
 
         segments = excel_segments
+        if "segment_qp_sidx" not in dir():
+            segment_qp_sidx = list(range(len(segments)))
         st.write(f"📚 Using {len(segments)} paper segment(s)")
 
         # ── 4) Row → MS section mapping ──────────────────────────────────────────
         #
-        # IB MS PDFs interleave SL and HL sections for each exam session:
-        #   [SL exam1, HL exam1, SL exam2, HL exam2, ...]
-        #
-        # Excel rows represent ONE paper type (e.g. HL only, or SL only,
-        # or a single paper number). We must select ONLY the matching subset.
-        #
-        # Algorithm:
-        #   1. Sort segments by their first QP page (chronological exam order).
-        #   2. Compute max_qn for each segment and the Excel overall max_qn.
-        #   3. If n_ms ≈ k × n_segs (k=2 typical for SL+HL):
-        #        a) Try BOTH alternations (even indices vs odd indices).
-        #        b) Choose the alternation whose average max_qn is CLOSER
-        #           to the Excel overall_max_qn.
-        #        c) If neither alternation gives enough sections, use threshold filter.
-        #   4. If n_ms == n_segs: direct positional mapping.
-        #   5. If n_ms < n_segs: direct positional with warnings.
+        # PURE POSITIONAL by QP exam session order.
+        # segment_qp_sidx[i] = QP session index for segment i.
+        # QP session N  →  MS section N  (same 0-based index).
+        # This guarantees: exam 1 in QP = exam 1 in MS, exam 7 = exam 7, etc.
         # ─────────────────────────────────────────────────────────────────────────
 
         row_to_section     = {}
         row_to_section_idx = {}
-
-        def _seg_min_page(seg_rows_):
-            pgs = [xl_rows[ri].get("page_num", 0) for ri in seg_rows_
-                   if xl_rows[ri].get("page_num", 0) > 0]
-            return min(pgs) if pgs else 999999
-
-        def _seg_max_qn(seg_rows_):
-            return max((xl_rows[ri].get("qn", 0) for ri in seg_rows_), default=0)
-
-        sorted_seg_indices = sorted(range(len(segments)),
-                                    key=lambda i: _seg_min_page(segments[i]))
+        mismatch_warnings  = []
         n_segs = len(segments)
         n_ms   = len(ms_sections)
 
-        # Max question numbers
-        seg_max_qns        = [_seg_max_qn(segments[si]) for si in range(n_segs)]
-        overall_excel_max_qn = max(seg_max_qns) if seg_max_qns else 13
-
-        def _ms_max_qn(sec):
-            return sec.get("max_qn", len(sec.get("questions", {}))) if isinstance(sec, dict) else 0
-
-        # ── Select compatible MS sections ─────────────────────────────────────────
-        if n_ms == n_segs:
-            # Perfect count match → direct positional
-            compatible_ms = list(enumerate(ms_sections))
-            match_method  = "Direct positional (1:1)"
-
-        elif n_ms > n_segs:
-            # MS has more sections than Excel segments.
-            # Try multiple k values to find the best alternation pattern.
-            # Includes k=2 even when floor(n_ms/n_segs)=1 but ratio≈2
-            # (handles P2: 34 MS sections, 18 Excel segments).
-            ratio = n_ms / n_segs
-            k_candidates = set()
-            k_candidates.add(n_ms // n_segs)             # floor ratio
-            if n_ms // n_segs == 0:
-                k_candidates.add(1)
-            if ratio >= 1.5:                              # ratio close to 2
-                k_candidates.add(2)
-            if ratio >= 2.5:                              # ratio close to 3
-                k_candidates.add(3)
-            k_candidates = sorted(k_candidates)           # try smallest first
-
-            best_alt  = None
-            best_diff = float("inf")
-            best_k    = 1
-
-            for k in k_candidates:
-                if k == 0:
-                    k = 1
-                for start in range(k):
-                    alt = [(i, ms_sections[i])
-                           for i in range(start, n_ms, k)
-                           if i < n_ms]
-                    # Allow ±1 slack to handle uneven sections (e.g. 34 sections, 18 needed)
-                    if len(alt) < n_segs - 1:
-                        continue
-                    alt_use = alt[:n_segs]   # may be 1 short — padded below
-                    avg_max_qn = sum(_ms_max_qn(s) for _, s in alt_use) / len(alt_use)
-                    diff = abs(avg_max_qn - overall_excel_max_qn)
-                    if diff < best_diff:
-                        best_diff = diff
-                        best_alt  = alt_use
-                        best_k    = k
-
-            if best_alt and len(best_alt) >= n_segs - 1:
-                # If 1 short, extend with the nearest unused section
-                if len(best_alt) < n_segs:
-                    used_indices = {i for i, _ in best_alt}
-                    for i, s in enumerate(ms_sections):
-                        if i not in used_indices:
-                            best_alt = list(best_alt) + [(i, s)]
-                            break
-                compatible_ms = best_alt[:n_segs]
-                avg_sel = sum(_ms_max_qn(s) for _, s in compatible_ms) / len(compatible_ms)
-                match_method  = (f"Alternation k={best_k} start={compatible_ms[0][0]} "
-                                 f"(avg_max_qn={avg_sel:.1f} vs excel={overall_excel_max_qn})")
+        for seg_pos, seg_rows in enumerate(segments):
+            # QP session index stored during segment building
+            qp_sidx = (segment_qp_sidx[seg_pos]
+                       if seg_pos < len(segment_qp_sidx) else seg_pos)
+            # Direct: MS section at same position as QP session
+            if qp_sidx < n_ms:
+                ms_idx = qp_sidx
+                sec    = ms_sections[ms_idx]
+            elif n_ms > 0:
+                ms_idx = n_ms - 1          # last available section
+                sec    = ms_sections[ms_idx]
+                mismatch_warnings.append(
+                    f"Segment {seg_pos+1} (QP session {qp_sidx+1}) beyond "
+                    f"MS range ({n_ms} sections) — using last section"
+                )
             else:
-                # Alternation didn't give enough → filter by max_qn proximity
-                threshold = max(overall_excel_max_qn - 3, 3)
-                compatible_ms = sorted(
-                    [(i, s) for i, s in enumerate(ms_sections)
-                     if abs(_ms_max_qn(s) - overall_excel_max_qn) <= 4],
-                    key=lambda x: abs(_ms_max_qn(x[1]) - overall_excel_max_qn)
-                )[:n_segs]
-                match_method  = f"Proximity filter (excel_max_qn={overall_excel_max_qn})"
+                ms_idx = -1
+                sec    = None
+                mismatch_warnings.append(f"Segment {seg_pos+1}: no MS sections")
 
-            if len(compatible_ms) < n_segs:
-                # Last resort
-                compatible_ms = list(enumerate(ms_sections))[-n_segs:]
-                match_method  += " [last-resort fallback]"
-
-        else:
-            # n_ms < n_segs — fewer MS sections than segments
-            compatible_ms = list(enumerate(ms_sections))
-            match_method  = f"Partial ({n_ms} MS < {n_segs} Excel segs — some MS answers missing)"
-
-        # ── Positional mapping within compatible MS sections ──────────────────────
-        seg_paper_codes    = [None] * n_segs
-        mismatch_warnings  = []
-
-        # ── Content-based sanity check helpers ────────────────────────────────────
-        def _qp_segment_keywords(seg_rows_, qp_bytes_):
-            """Extract keywords from first QP question in this segment."""
-            try:
-                _doc = fitz.open(stream=qp_bytes_, filetype="pdf")
-                words = set()
-                for ri in seg_rows_[:3]:   # check first 3 rows
-                    pg  = xl_rows[ri].get("page_num", 0)
-                    if pg and pg <= len(_doc):
-                        txt = _doc[pg - 1].get_text().lower()
-                        # Extract meaningful words (4+ chars, alpha only)
-                        words.update(w for w in re.findall(r"[a-z]{4,}", txt)
-                                     if w not in _STOP_WORDS)
-                _doc.close()
-                return words
-            except Exception:
-                return set()
-
-        def _ms_section_keywords(sec_):
-            """Extract keywords from first MS question in this section."""
-            try:
-                _doc = fitz.open(stream=ms_bytes, filetype="pdf")
-                words = set()
-                for qn_key in sorted(sec_.get("questions", {}).keys())[:2]:
-                    q_info_ = sec_["questions"][qn_key]
-                    pi_     = q_info_.get("page_idx", 0)
-                    if pi_ < len(_doc):
-                        txt = _doc[pi_].get_text().lower()
-                        words.update(w for w in re.findall(r"[a-z]{4,}", txt)
-                                     if w not in _STOP_WORDS)
-                _doc.close()
-                return words
-            except Exception:
-                return set()
-
-        _STOP_WORDS = {
-            "that", "this", "with", "from", "have", "will", "your", "each",
-            "note", "award", "mark", "where", "when", "show", "find", "hence",
-            "answer", "correct", "given", "value", "total", "marks", "method",
-            "following", "question", "continued", "maximum", "minimum",
-            "which", "then", "also", "both", "such", "their", "there",
-        }
-
-        for pos, seg_idx in enumerate(sorted_seg_indices):
-            seg_rows = segments[seg_idx]
-            if pos < len(compatible_ms):
-                orig_ms_idx, sec = compatible_ms[pos]
-                # Sanity check 1: max_qn difference
-                seg_mq = seg_max_qns[seg_idx]
-                ms_mq  = _ms_max_qn(sec)
-                qn_diff = abs(ms_mq - seg_mq) if ms_mq > 0 else 0
-
-                # Sanity check 2: keyword overlap (content-based)
-                overlap_ok = True
-                overlap_ratio = 1.0
-                if is_structured and qn_diff <= 3:
-                    qp_kws = _qp_segment_keywords(seg_rows, qp_bytes)
-                    ms_kws = _ms_section_keywords(sec)
-                    if qp_kws and ms_kws:
-                        common = qp_kws & ms_kws
-                        overlap_ratio = len(common) / max(len(qp_kws & ms_kws | (qp_kws & ms_kws)), 1)
-                        # Require at least 3 shared content words
-                        overlap_ok = len(common) >= 3
-
-                if qn_diff > 3:
-                    mismatch_warnings.append(
-                        f"Seg{seg_idx+1}(max_q={seg_mq}) ↔ MSsec{orig_ms_idx+1}(max_q={ms_mq}): "
-                        f"question count mismatch (diff={qn_diff})"
-                    )
-            else:
-                orig_ms_idx, sec = -1, None
-                mismatch_warnings.append(f"Seg{seg_idx+1} has no matching MS section")
-            ms_idx = orig_ms_idx
             for ri in seg_rows:
                 row_to_section[ri]     = sec
                 row_to_section_idx[ri] = ms_idx
 
+        match_method = (f"Direct QP-session order "
+                        f"({n_segs} Excel segments → {n_ms} MS sections, "
+                        f"ratio={n_ms/max(n_segs,1):.2f})")
+
+        # Dummy variables kept for compatibility with the match table display below
+        seg_max_qns          = [0] * n_segs
+        overall_excel_max_qn = 5
+        def _ms_max_qn(s):
+            return s.get("max_qn", len(s.get("questions", {}))) if isinstance(s, dict) else 0
         try:
             ms_code_to_section = {}
             for _ms_i, _ms_sec in enumerate(ms_sections):
@@ -2662,7 +2514,7 @@ if st.button(
         except Exception:
             ms_code_to_section = {}
 
-        paired_by_code = sum(1 for code in seg_paper_codes if code and code in ms_code_to_section)
+        paired_by_code = 0
         unpaired_segs  = mismatch_warnings
 
         if is_structured:
