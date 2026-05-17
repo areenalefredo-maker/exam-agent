@@ -795,6 +795,12 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
         page = doc[pi]
         ph = page.rect.height
         td = page.get_text("dict")
+
+        # Skip pages that are general marking instructions (not real Q answers)
+        page_text = page.get_text()
+        if _MS_INSTR_PAT.search(page_text):
+            continue
+
         for block in td.get("blocks", []):
             if block.get("type") != 0:
                 continue
@@ -909,7 +915,29 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     if len(merged_secs) != len(sections):
         sections = merged_secs
 
-    sections = [s for s in sections if len(s["questions"]) >= 3]
+    # Filter: remove sections with anomalous question numbers (merged artifacts)
+    # and sections missing Q1 (not a real answer section start)
+    def _is_valid_section(s):
+        qs = set(s["questions"].keys())
+        if len(qs) < 3:
+            return False
+        if 1 not in qs:
+            return False   # missing Q1 = not a real section
+        max_q = max(qs)
+        # Check for outlier Q numbers that indicate a merged/corrupt section
+        # e.g. qs=[1,2,3,4,5,8] — Q8 is outlier when max expected is 5
+        expected_range = range(1, max_q + 1)
+        valid_qs = {q for q in qs if q <= max_q}
+        # Any question > 1.6x the second-highest is an outlier
+        sorted_qs = sorted(qs)
+        if len(sorted_qs) >= 2:
+            second_max = sorted_qs[-2]
+            top_q = sorted_qs[-1]
+            if top_q > second_max + 1:
+                return False   # outlier top question (gap > 1 from second-highest)
+        return True
+
+    sections = [s for s in sections if _is_valid_section(s)]
 
     instr_pat = re.compile(
         r"(instructions to examiners|abbreviations|marks? awarded for|"
@@ -962,6 +990,25 @@ _S_CW_PT = _S_CW * 28.35
 _CONTINUES_PAT = re.compile(r'this question continues on the following page', re.I)
 _CONTINUED_PAT = re.compile(r'question\s+\d+\s+continued', re.I)
 _MS_CONT_PAT   = re.compile(r'question\s*\d*\s*continued\.?|this question continues', re.I)
+
+# Instruction-page detector: these phrases appear ONLY in general marking guidance,
+# never in actual Q-answer sections.
+_MS_INSTR_PAT  = re.compile(
+    r"implied marks appear in brackets|"
+    r"follow.through \(FT\) marks are awarded|"
+    r"instructions to examiners|"
+    r"using the markscheme|"
+    r"method and answer.accuracy marks|"
+    r"mis.read.*candidate incorrectly copies|"
+    r"abbreviations.*marks awarded for attempting|"
+    r"alternative forms.*accept equivalent|"
+    r"presentation of candidate work|"
+    r"crossed out work.*candidate has drawn|"
+    r"gcalculators.*gdc is required|"
+    r"GDC is required for this paper|"
+    r"markscheme.*may 20|markscheme.*november 20",
+    re.IGNORECASE | re.DOTALL
+)
 
 _S_FOOTER_PAT  = re.compile(
     r"(M\d{2}/\d|N\d{2}/\d|\d{4}EP\d+|©\s*\d{4}|\bTurn over\b|\bPlease do not\b|"
@@ -1122,6 +1169,10 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
     X_RIGHT = pw - 22.0
 
     if is_cont:
+        # Skip if this is a cover/instruction page (never a valid continuation)
+        if _QP_INSTR_PAT.search(page.get_text()):
+            return None, False
+
         hb = 0
         cb = 0
         for x0, y0, y1, txt in lines:
@@ -1153,7 +1204,9 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
                 break
             if re.match(r'^\[\s*Maximum mark', txt, re.I):
                 qb = max(qb, y1)
-        cs = qb + 2
+        # Start crop FROM the question number line (includes "[Maximum mark: N]")
+        # qt is the top of "N." line; [Maximum mark] is on the same line.
+        cs = max(0, qt - 6)
 
     nq = ph * 0.92
     if not is_cont:
@@ -1218,9 +1271,9 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
     pix  = page.get_pixmap(matrix=fitz.Matrix(_S_SCALE, _S_SCALE), clip=clip, alpha=False)
     img  = Image.open(io.BytesIO(pix.tobytes("png")))
 
-    # Strip the original question number marker ("N.") from the image
-    # while keeping "[Maximum mark: ...]" which is on the same line but further right.
-    # Locate the q-marker span via text extraction and white it out.
+    # Strip "N." from the question number line, keep "[Maximum mark: ...]"
+    # The "N." span is at far-left (x < 60pt), on the same line as qt.
+    # "[Maximum mark]" span is further right (x ≈ 70+pt) — NOT whited out.
     if not is_cont:
         for block in page.get_text("dict").get("blocks", []):
             if block.get("type") != 0:
@@ -1229,10 +1282,12 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
                 for span in line.get("spans", []):
                     stxt = span.get("text", "").strip()
                     sbb  = span.get("bbox", [0, 0, 0, 0])
-                    # Match "N." or "N " at far-left (x < 60pt), same y as cs
-                    if (re.match(r"^\d{1,2}[.\s]?$", stxt)
+                    # Only match the bare "N." or "N" span (not [Maximum mark])
+                    if (re.match(r"^\d{1,2}[.]?$", stxt)
                             and sbb[0] < 60
-                            and abs(sbb[1] - qt) < 20 if qt is not None else sbb[1] < cs + 20):
+                            and sbb[2] < 65
+                            and qt is not None
+                            and abs(sbb[1] - qt) < 20):
                         img = _s_whiteout(
                             img,
                             [(sbb[0], sbb[1], sbb[2] + 4, sbb[3] + 2)],
@@ -1281,6 +1336,9 @@ def _crop_qp_full(qp_doc, pg, qn, pg_end: int = 0):
     for _ in range(3):
         pn += 1
         if pn > len(qp_doc):
+            break
+        # Never cross into a cover/instruction page (start of next session)
+        if _QP_INSTR_PAT.search(qp_doc[pn - 1].get_text()):
             break
         ic, hc2 = _crop_qp_page(qp_doc, pn - 1, qn, True)
         if ic is None:
@@ -1412,6 +1470,11 @@ def _crop_ms_pieces(ms_doc, q_info):
             piece = img.crop((lx, tp, rx, bp))
             piece = _s_trim_bottom(piece)
             if piece.height > 10:
+                # Guard: skip if this page contains general marking instructions
+                page_txt = pg.get_text()
+                if _MS_INSTR_PAT.search(page_txt):
+                    continue   # skip instruction pages entirely
+
                 # Strip "N." question number marker from the first piece
                 if pi == spi:
                     for block in pg.get_text("dict").get("blocks", []):
@@ -2215,31 +2278,85 @@ if st.button(
         st.write(f"✅ Found {len(locations)} question marker(s) in QP")
 
         # Segment detection (for MS matching)
-        excel_segments: list[list[int]] = []
-        cur_seg: list[int] = []
-        seg_max = 0
-        seg_ref = None
-        for i, r in enumerate(xl_rows):
-            qn  = r["qn"]
-            ref = r.get("ref", "")
-            new_segment = False
+        # ── Build segments from QP PDF exam boundaries ─────────────────────────
+        # Detect exam session start pages from QP PDF (pages with Q1 [Maximum mark]).
+        # Then assign each Excel row to its session by QP page number.
+        # This guarantees: Excel segment N = QP session N = MS section N (positional).
+        _QP_INSTR_PAT_LOCAL = re.compile(
+            r"instructions to candidates|do not open this examination|"
+            r"graphic display calculator is required|"
+            r"answer all the questions in the answer booklet",
+            re.IGNORECASE
+        )
+
+        qp_session_starts: list[int] = []   # QP page numbers (1-based) where each exam starts
+        try:
+            _qp_tmp = fitz.open(stream=qp_bytes, filetype="pdf")
+            for _pi in range(len(_qp_tmp)):
+                _pg_txt = _qp_tmp[_pi].get_text()
+                if re.search(r"1[.]\s{0,5}\[Maximum mark", _pg_txt):
+                    qp_session_starts.append(_pi + 1)   # 1-based page number
+            _qp_tmp.close()
+        except Exception:
+            qp_session_starts = []
+
+        # Assign each Excel row to a QP session index (0-based)
+        def _row_session_idx(row_page: int) -> int:
+            """Return 0-based session index for a row whose QP page is row_page."""
+            if not qp_session_starts or row_page <= 0:
+                return 0
+            # Binary search: find last session start ≤ row_page
+            idx_ = 0
+            for k_, sp in enumerate(qp_session_starts):
+                if sp <= row_page:
+                    idx_ = k_
+                else:
+                    break
+            return idx_
+
+        if qp_session_starts:
+            # Group Excel rows by their QP session
+            session_buckets: dict[int, list[int]] = {}
+            for i, r in enumerate(xl_rows):
+                pg = r.get("page_num", 0) or 0
+                sidx = _row_session_idx(pg)
+                session_buckets.setdefault(sidx, []).append(i)
+            # Build excel_segments in QP session order
+            excel_segments = [
+                session_buckets[k]
+                for k in sorted(session_buckets.keys())
+                if session_buckets[k]
+            ]
+            st.write(f"✅ Segments built from QP PDF: {len(excel_segments)} session(s) "
+                     f"from {len(qp_session_starts)} QP exam boundaries")
+        else:
+            # Fallback: original ref-based segmentation
+            excel_segments = []
+            cur_seg: list[int] = []
+            seg_max = 0
+            seg_ref = None
+            for i, r in enumerate(xl_rows):
+                qn  = r["qn"]
+                ref = r.get("ref", "")
+                new_segment = False
+                if cur_seg:
+                    if ref != seg_ref:
+                        new_segment = True
+                    elif qn == 1:
+                        new_segment = True
+                    elif seg_max >= 10 and qn < seg_max - 5:
+                        new_segment = True
+                if new_segment:
+                    excel_segments.append(cur_seg)
+                    cur_seg = []
+                    seg_max = 0
+                cur_seg.append(i)
+                if qn > seg_max:
+                    seg_max = qn
+                seg_ref = ref
             if cur_seg:
-                if ref != seg_ref:
-                    new_segment = True
-                elif qn == 1:
-                    new_segment = True
-                elif seg_max >= 10 and qn < seg_max - 5:
-                    new_segment = True
-            if new_segment:
                 excel_segments.append(cur_seg)
-                cur_seg = []
-                seg_max = 0
-            cur_seg.append(i)
-            if qn > seg_max:
-                seg_max = qn
-            seg_ref = ref
-        if cur_seg:
-            excel_segments.append(cur_seg)
+            st.warning("⚠ Could not detect QP session boundaries — using ref-based segments")
 
         seg_offsets = infer_segment_page_offsets(locations, xl_rows, excel_segments)
         row_offset  = {}
