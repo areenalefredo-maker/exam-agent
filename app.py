@@ -2400,7 +2400,10 @@ if st.button(
             _qp_tmp = fitz.open(stream=qp_bytes, filetype="pdf")
             for _pi in range(len(_qp_tmp)):
                 _pg_txt = _qp_tmp[_pi].get_text()
-                if re.search(r"1[.][\s\x07]*\[Maximum mark", _pg_txt):
+                # Try multiple patterns to handle different PDF text encodings
+                if (re.search(r"1[.][\s\x07]*\[Maximum mark", _pg_txt) or
+                        re.search(r"^\s*1\.\s*\[Maximum mark", _pg_txt, re.M) or
+                        re.search(r"1\.\s{0,10}Maximum mark", _pg_txt)):
                     qp_session_starts.append(_pi + 1)   # 1-based page number
             _qp_tmp.close()
         except Exception:
@@ -2411,7 +2414,6 @@ if st.button(
             """Return 0-based session index for a row whose QP page is row_page."""
             if not qp_session_starts or row_page <= 0:
                 return 0
-            # Binary search: find last session start ≤ row_page
             idx_ = 0
             for k_, sp in enumerate(qp_session_starts):
                 if sp <= row_page:
@@ -2419,6 +2421,22 @@ if st.button(
                 else:
                     break
             return idx_
+
+        # Build ref→session mapping from QP PDF for fallback matching
+        _ref_to_session: dict = {}
+        try:
+            _qp_ref_doc = fitz.open(stream=qp_bytes, filetype="pdf")
+            for _si, _sp in enumerate(qp_session_starts):
+                _ptxt = _qp_ref_doc[_sp - 1].get_text()
+                _cm = re.search(r"(\d{4}[-–]\d{4})", _ptxt)
+                if _cm:
+                    _ref_to_session[_cm.group(1).replace("–", "-")] = _si
+                _dm = re.search(r"(May|November|March)\s+(\d{4})", _ptxt, re.I)
+                if _dm:
+                    _ref_to_session[f"{_dm.group(1)} {_dm.group(2)}"] = _si
+            _qp_ref_doc.close()
+        except Exception:
+            _ref_to_session = {}
 
         if qp_session_starts:
             # Group Excel rows by their QP session index
@@ -2510,6 +2528,10 @@ if st.button(
         mismatch_warnings  = []
         n_segs = len(segments)
         n_ms   = len(ms_sections)
+
+        # Log the mapping for debugging
+        st.write(f"🔗 Matching {len(segments)} Excel segments to {n_ms} MS sections "
+                 f"(method: {match_method if 'match_method' in dir() else 'Direct QP-session'})")
 
         for seg_pos, seg_rows in enumerate(segments):
             # QP session index stored during segment building
