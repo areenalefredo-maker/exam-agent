@@ -211,6 +211,7 @@ def parse_excel(uploaded_file) -> list[dict]:
     mrk_idx  = col_idx("Marks", "Mark", "Points", "Score")
     qut_idx  = col_idx("Quote", "Note", "Motivational quote")
     ref_idx  = col_idx("Reference", "Ref", "Session", "Year", "Paper", "Exam Session", "Paper Reference")
+    ms_col_idx = col_idx("Mark Scheme", "MarkScheme", "MS", "Answer", "Mark scheme", "mark scheme")
 
     parse_excel.last_headers = headers
     parse_excel.last_column_map = {
@@ -310,6 +311,10 @@ def parse_excel(uploaded_file) -> list[dict]:
             "qn": q_num, "page_num": page_num, "page_num_end": page_num_end,
             "topic": topic, "difficulty": difficulty, "marks": marks,
             "quote": quote, "ref": ref,
+            "ms_text": (str(row[ms_col_idx].value).strip()
+                        if ms_col_idx is not None and row[ms_col_idx].value
+                           and str(row[ms_col_idx].value) not in ("None", "nan", "")
+                        else ""),
         })
 
     parse_excel.last_duplicates = duplicates
@@ -1437,6 +1442,71 @@ def _last_ms_y(pg, top, hard):
     return last
 
 
+def _extract_answer_keywords(excel_ms_text: str) -> list[str]:
+    """
+    Extract numeric and key word tokens from an Excel MS answer cell.
+    These are used to verify/locate the correct MS section in the PDF.
+    """
+    if not excel_ms_text or excel_ms_text in ("nan", "None", ""):
+        return []
+    import re as _re
+    # Extract numbers (including decimals)
+    nums = _re.findall(r"\b\d+\.?\d*\b", excel_ms_text)
+    # Extract meaningful words (5+ chars, no LaTeX commands)
+    words = [w.lower() for w in _re.findall(r"[a-z]{5,}", excel_ms_text, _re.I)
+             if w.lower() not in {"total", "award", "marks", "where", "which", "their",
+                                   "answer", "hence", "shown", "correct", "value"}]
+    # Combined: at least the top unique numbers and words
+    return list(set(nums[:8] + words[:5]))
+
+
+def _find_ms_section_by_keywords(ms_doc, ms_sections, keywords: list[str],
+                                  qn: int, qp_max_mark: int = 0) -> tuple:
+    """
+    Search all MS sections for the one that best matches the given keywords.
+    Returns (best_section, best_section_idx) or (None, -1).
+    """
+    if not keywords:
+        return None, -1
+
+    best_sec   = None
+    best_idx   = -1
+    best_score = 0
+
+    for sec_idx, sec in enumerate(ms_sections):
+        # Only check sections that have the target question number
+        q_info = sec.get("questions", {}).get(qn)
+        if q_info is None:
+            continue
+
+        # Gather text from the Q pages in this section
+        sec_text = ""
+        try:
+            start_pi = q_info["page_idx"]
+            end_pi   = q_info.get("end_page_idx", start_pi)
+            for pi in range(start_pi, min(end_pi + 1, len(ms_doc))):
+                sec_text += ms_doc[pi].get_text()
+        except Exception:
+            continue
+
+        # Score: how many keywords appear in this section?
+        score = sum(1 for kw in keywords if kw in sec_text)
+
+        # Bonus: marks validation
+        if qp_max_mark > 0:
+            import re as _re
+            tm = _re.search(r"Total[:\s]+(\d+)\s*marks?", sec_text, _re.I)
+            if tm and abs(int(tm.group(1)) - qp_max_mark) <= 1:
+                score += 3   # strong bonus for matching marks
+
+        if score > best_score:
+            best_score = score
+            best_sec   = sec
+            best_idx   = sec_idx
+
+    return (best_sec, best_idx) if best_score >= 2 else (None, -1)
+
+
 def _find_q_in_section_pages(ms_doc, sec, qn):
     """
     Strict fallback: scan section pages for a bold/left-margin question marker.
@@ -1780,8 +1850,26 @@ def build_structured_worksheet(
                     # Fallback 1: scan section pages for the question marker
                     if q_info is None:
                         q_info = _find_q_in_section_pages(ms_doc, sec, qn)
-                    # Fallback 2: use entire section content (guarantees no unmatched row)
-                    if q_info is None and sec.get("questions"):
+                    # Fallback 2: content-based search using Excel MS keywords
+                    # If positional mapping gave wrong section, keywords find correct one
+                    excel_ms_text = r.get("ms_text", "")
+                    if excel_ms_text:
+                        keywords = _extract_answer_keywords(excel_ms_text)
+                        if keywords:
+                            kw_sec, kw_idx = _find_ms_section_by_keywords(
+                                ms_doc, ms_sections, keywords, qn,
+                                r.get("marks", 0) or 0
+                            )
+                            if kw_sec is not None:
+                                # Keyword search found a better match
+                                # Use it if it differs from current section
+                                if kw_idx != row_to_section_idx.get(ri, -1):
+                                    sec    = kw_sec
+                                    q_info = sec.get("questions", {}).get(qn)
+                                    if q_info is None:
+                                        q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+                    # Fallback 3: use entire section content (guarantees no unmatched row)
+                    if q_info is None and sec and sec.get("questions"):
                         qs_sorted = sorted(sec["questions"].keys())
                         first_q   = sec["questions"][qs_sorted[0]]
                         last_q    = sec["questions"][qs_sorted[-1]]
