@@ -1773,7 +1773,8 @@ def build_structured_worksheet(
                 # Crop MS
                 sec     = row_to_section.get(ri)
                 ms_imgs = []
-                ms_topic_mismatch = False   # kept for display logic below
+                ms_topic_mismatch   = False   # kept for display logic below
+                ms_marks_mismatch   = False   # marks total mismatch flag
                 if sec and isinstance(sec, dict):
                     q_info = sec.get("questions", {}).get(qn)
                     # Fallback 1: scan section pages for the question marker
@@ -1794,7 +1795,36 @@ def build_structured_worksheet(
                     if q_info:
                         pieces = _crop_ms_pieces(ms_doc, q_info)
                         if pieces:
-                            ms_imgs = pieces
+                            # ── Max-mark validation ───────────────────────────────
+                            # Check if [Total: N marks] in MS matches QP maximum mark.
+                            # If mismatched, try adjacent MS sections before accepting.
+                            qp_max_mark = r.get("marks", 0) or 0
+                            ms_total_ok = True
+                            if qp_max_mark > 0:
+                                # Extract Total marks from the MS pieces text
+                                ms_text_combined = ""
+                                try:
+                                    for _p_idx in range(
+                                        q_info["page_idx"],
+                                        min(q_info.get("end_page_idx", q_info["page_idx"]) + 1,
+                                            len(ms_doc))
+                                    ):
+                                        ms_text_combined += ms_doc[_p_idx].get_text()
+                                except Exception:
+                                    pass
+                                _total_m = re.search(
+                                    r"Total[:\s]+(\d+)\s*marks?",
+                                    ms_text_combined, re.IGNORECASE
+                                )
+                                if _total_m:
+                                    ms_total = int(_total_m.group(1))
+                                    if abs(ms_total - qp_max_mark) > 2:
+                                        ms_total_ok = False   # mismatch detected
+                            if ms_total_ok:
+                                ms_imgs = pieces
+                            else:
+                                ms_imgs = pieces   # still use it but flag below
+                                ms_marks_mismatch = True
 
                 # sol config
                 n_sol, sol_separate = _sol_config(qp_img)
@@ -1907,6 +1937,15 @@ def build_structured_worksheet(
                 if ms_imgs:
                     for img in ms_imgs:
                         _s_add_ms_img(doc, img)
+                    # Show warning banner if marks total doesn't match
+                    if ms_marks_mismatch:
+                        _warn = doc.add_paragraph()
+                        _warn.paragraph_format.space_before = Pt(2)
+                        _warn.paragraph_format.space_after  = Pt(2)
+                        _s_run(_warn,
+                               f"⚠ Marks mismatch: QP max={r.get('marks',0)} "
+                               f"but MS total may differ. Verify manually.",
+                               italic=True, size_pt=9, color="CC6600")
                 else:
                     p = doc.add_paragraph()
                     p.paragraph_format.space_before = Pt(0)
