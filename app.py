@@ -1974,327 +1974,229 @@ def build_structured_worksheet(
         s.left_margin   = Cm(2)
         s.right_margin  = Cm(2)
 
-    # ── Group by normalized topic → difficulty (preserve Excel row order within) ──
+    # ── Sort rows by QP page number → exam order ────────────────────────────
+    # Do NOT group by chapter. Generate questions in original exam order.
     for r in xl_rows:
         r["_topic_norm"] = _normalize_topic(r.get("topic", ""))
 
-    grouped = {}
-    for ri, r in enumerate(xl_rows):
-        t = r["_topic_norm"]
-        d = r.get("difficulty") or "Unspecified"
-        grouped.setdefault(t, {}).setdefault(d, []).append(ri)
+    # Sort by QP page, then by question number within page
+    ordered_rows = sorted(
+        [(ri, r) for ri, r in enumerate(xl_rows)],
+        key=lambda x: (x[1].get("page_num", 9999) or 9999,
+                       x[1].get("qn", 0) or 0)
+    )
 
-    # Skip "Unclassified" / empty topics — don't include poorly classified rows
-    sorted_topics = sorted(
-        (t for t in grouped.keys() if t and t.lower() not in ("unclassified", "unspecified", "")),
-        key=_chapter_sort_key
-    )
-    _skipped_unclassified = sum(
-        len(ris)
-        for t, diffs in grouped.items()
-        if not t or t.lower() in ("unclassified", "unspecified", "")
-        for ris in diffs.values()
-    )
-    if _skipped_unclassified:
-        import streamlit as _st_tmp
-        try:
-            _st_tmp.info(f"ℹ Skipped {_skipped_unclassified} unclassified row(s) — "
-                         "set Topic in Excel to include them.")
-        except Exception:
-            pass
-
-    # Total questions = only classified rows (unclassified are skipped)
-    _classified_count = sum(
-        1 for r in xl_rows
-        if r.get("_topic_norm") and r["_topic_norm"].lower() not in ("unclassified","unspecified","")
-    )
-    total_qs = _classified_count if _classified_count > 0 else len(xl_rows)
+    total_qs = len(ordered_rows)
     done_qs  = 0
     first    = True
-    ws_q     = 0      # per-chapter counter (resets each new chapter)
-    cur_t    = None
-    cur_d    = None
+    ws_q     = 0   # global worksheet question counter (never resets)
 
-    for topic in sorted_topics:
-        diffs = grouped[topic]
-        sorted_diffs = sorted(
-            diffs.keys(),
-            key=lambda d: DIFF_ORDER.index(d) if d in DIFF_ORDER else 99
-        )
+    for ri, r in ordered_rows:
+        pg    = r.get("page_num", 0)
+        qn    = r.get("qn", 0)
+        topic = r.get("_topic_norm") or "Unclassified"
+        diff  = r.get("difficulty") or "Medium"
 
-        for diff in sorted_diffs:
-            ri_list = diffs[diff]
-            for ri in ri_list:
-                r    = xl_rows[ri]
-                pg   = r.get("page_num", 0)
-                qn   = r.get("qn", 0)
-                marks_raw = r.get("marks")
-                marks = int(float(str(marks_raw))) if marks_raw else 0
-                # Skip rows where marks couldn't be determined (likely bad data)
-                if marks <= 0:
-                    done_qs += 1
-                    continue
-                marks = marks or 1
-                quote = r.get("quote", "") or ""
-                if quote in ("nan",):
-                    quote = ""
+        marks_raw = r.get("marks")
+        marks = int(float(str(marks_raw))) if marks_raw else 0
+        if marks <= 0:
+            done_qs += 1
+            continue
+        marks = marks or 1
 
-                # Special override: Q9 page 147
-                if qn == 9 and pg == 147:
-                    marks = 6
+        quote = r.get("quote", "") or ""
+        if quote in ("nan",):
+            quote = ""
 
-                # Crop QP (pass pg_end so multi-page questions are complete)
-                pg_end = r.get("page_num_end", 0) or 0
-                qp_img = _crop_qp_full(qp_doc, pg, qn, pg_end=pg_end)
-                # Try text extraction (text-first for non-diagram questions)
-                _qp_txt = _extract_qp_text(qp_doc, pg, qn) if pg > 0 else None
+        # ── Crop QP ─────────────────────────────────────────────────────────
+        pg_end  = r.get("page_num_end", 0) or 0
+        qp_img  = _crop_qp_full(qp_doc, pg, qn, pg_end=pg_end)
+        _qp_txt = _extract_qp_text(qp_doc, pg, qn) if pg > 0 else None
 
-                # Crop MS
-                sec     = row_to_section.get(ri)
-                ms_imgs = []
-                ms_topic_mismatch   = False   # kept for display logic below
-                ms_marks_mismatch   = False   # marks total mismatch flag
-                if sec and isinstance(sec, dict):
-                    q_info = sec.get("questions", {}).get(qn)
-                    # Fallback 1: scan section pages for the question marker
-                    if q_info is None:
-                        q_info = _find_q_in_section_pages(ms_doc, sec, qn)
-                    # Fallback 2: content-based search using Excel MS keywords
-                    # If positional mapping gave wrong section, keywords find correct one
-                    excel_ms_text = r.get("ms_text", "")
-                    if excel_ms_text:
-                        keywords = _extract_answer_keywords(excel_ms_text)
-                        if keywords:
-                            kw_sec, kw_idx = _find_ms_section_by_keywords(
-                                ms_doc, ms_sections, keywords, qn,
-                                r.get("marks", 0) or 0
-                            )
-                            if kw_sec is not None:
-                                # Keyword search found a better match
-                                # Use it if it differs from current section
-                                if kw_idx != row_to_section_idx.get(ri, -1):
-                                    sec    = kw_sec
-                                    q_info = sec.get("questions", {}).get(qn)
-                                    if q_info is None:
-                                        q_info = _find_q_in_section_pages(ms_doc, sec, qn)
-                    # Fallback 3: use entire section content (guarantees no unmatched row)
-                    if q_info is None and sec and sec.get("questions"):
-                        qs_sorted = sorted(sec["questions"].keys())
-                        first_q   = sec["questions"][qs_sorted[0]]
-                        last_q    = sec["questions"][qs_sorted[-1]]
-                        q_info = {
-                            "page_idx":       first_q["page_idx"],
-                            "top_y":          first_q["top_y"],
-                            "end_page_idx":   last_q.get("end_page_idx", last_q["page_idx"]),
-                            "end_y":          last_q.get("end_y", last_q.get("bottom_y", 700)),
-                            "marker_right_x": 0,
-                        }
-                    if q_info:
-                        # Ensure complete MS: extend end_page_idx until [Total:] found
-                        _q_info_ext = dict(q_info)
-                        _max_mark   = r.get("marks", 0) or 0
-                        _epi_orig   = _q_info_ext.get("end_page_idx", _q_info_ext["page_idx"])
-                        for _extra in range(0, 6):
-                            _test_pi = _epi_orig + _extra
-                            if _test_pi >= len(ms_doc):
-                                break
-                            _test_txt = ms_doc[_test_pi].get_text()
-                            if re.search(r"\[Total[:\s]", _test_txt, re.I):
-                                _q_info_ext["end_page_idx"] = _test_pi
-                                _q_info_ext["end_y"]        = ms_doc[_test_pi].rect.height * 0.95
-                                break   # found Total marker
-                        pieces = _crop_ms_pieces(ms_doc, _q_info_ext)
-                        if pieces:
-                            # ── Max-mark validation ───────────────────────────────
-                            # Check if [Total: N marks] in MS matches QP maximum mark.
-                            # If mismatched, try adjacent MS sections before accepting.
-                            qp_max_mark = r.get("marks", 0) or 0
-                            ms_total_ok = True
-                            if qp_max_mark > 0:
-                                # Extract Total marks from the MS pieces text
-                                ms_text_combined = ""
-                                try:
-                                    for _p_idx in range(
-                                        q_info["page_idx"],
-                                        min(q_info.get("end_page_idx", q_info["page_idx"]) + 1,
-                                            len(ms_doc))
-                                    ):
-                                        ms_text_combined += ms_doc[_p_idx].get_text()
-                                except Exception:
-                                    pass
-                                _total_m = re.search(
-                                    r"Total[:\s]+(\d+)\s*marks?",
-                                    ms_text_combined, re.IGNORECASE
-                                )
-                                if _total_m:
-                                    ms_total = int(_total_m.group(1))
-                                    if abs(ms_total - qp_max_mark) > 2:
-                                        ms_total_ok = False   # mismatch detected
-                            if ms_total_ok:
-                                ms_imgs = pieces
-                            else:
-                                ms_imgs = pieces   # still use it but flag below
-                                ms_marks_mismatch = True
+        # ── Crop MS ─────────────────────────────────────────────────────────
+        sec     = row_to_section.get(ri)
+        ms_imgs = []
+        ms_marks_mismatch = False
+        if sec and isinstance(sec, dict):
+            q_info = sec.get("questions", {}).get(qn)
+            if q_info is None:
+                q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+            excel_ms_text = r.get("ms_text", "")
+            if excel_ms_text:
+                keywords = _extract_answer_keywords(excel_ms_text)
+                if keywords:
+                    kw_sec, kw_idx = _find_ms_section_by_keywords(
+                        ms_doc, ms_sections, keywords, qn, r.get("marks", 0) or 0)
+                    if kw_sec is not None and kw_idx != row_to_section_idx.get(ri, -1):
+                        sec    = kw_sec
+                        q_info = sec.get("questions", {}).get(qn)
+                        if q_info is None:
+                            q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+            if q_info is None and sec and sec.get("questions"):
+                qs_s   = sorted(sec["questions"].keys())
+                first_q = sec["questions"][qs_s[0]]
+                last_q  = sec["questions"][qs_s[-1]]
+                q_info = {
+                    "page_idx":      first_q["page_idx"],
+                    "top_y":         first_q["top_y"],
+                    "end_page_idx":  last_q.get("end_page_idx", last_q["page_idx"]),
+                    "end_y":         last_q.get("end_y", last_q.get("bottom_y", 700)),
+                    "marker_right_x": 0,
+                }
+            if q_info:
+                # Extend to [Total:] marker for complete MS
+                _qi = dict(q_info)
+                _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
+                for _ex in range(6):
+                    _tpi = _epi0 + _ex
+                    if _tpi >= len(ms_doc): break
+                    if re.search(r"\[Total[:\s]", ms_doc[_tpi].get_text(), re.I):
+                        _qi["end_page_idx"] = _tpi
+                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.95
+                        break
+                pieces = _crop_ms_pieces(ms_doc, _qi)
+                if pieces:
+                    qp_max_mark = r.get("marks", 0) or 0
+                    if qp_max_mark > 0:
+                        _ms_combo = ""
+                        try:
+                            for _pi2 in range(_qi["page_idx"],
+                                              min(_qi.get("end_page_idx", _qi["page_idx"]) + 1,
+                                                  len(ms_doc))):
+                                _ms_combo += ms_doc[_pi2].get_text()
+                        except Exception:
+                            pass
+                        _tm = re.search(r"Total[:\s]+(\d+)\s*marks?", _ms_combo, re.I)
+                        if _tm and abs(int(_tm.group(1)) - qp_max_mark) > 2:
+                            ms_marks_mismatch = True
+                    ms_imgs = pieces
 
-                # sol config
-                n_sol, sol_separate = _sol_config(qp_img)
+        # Skip question if no QP content and no MS content
+        if not qp_img and not _qp_txt:
+            done_qs += 1
+            continue
 
-                # ── Chapter heading (on same page as Q — no separate break) ──
-                if topic != cur_t:
-                    h = doc.add_paragraph()
-                    if not first:
-                        pass   # page break is on qh below
-                    h.paragraph_format.space_before = Pt(0)
-                    h.paragraph_format.space_after  = Pt(6)
-                    _s_run(h, topic, bold=True, size_pt=20)
-                    cur_t = topic
-                    cur_d = None
-                    ws_q  = 0   # ← reset per-chapter counter
+        # ── Build Word output ────────────────────────────────────────────────
+        ws_q += 1
+        n_sol = _sol_config(qp_img) if qp_img else 7
 
-                if diff != cur_d:
-                    dp = doc.add_paragraph()
-                    dp.paragraph_format.space_before = Pt(6)
-                    dp.paragraph_format.space_after  = Pt(4)
-                    _s_run(dp, f"— {diff} —", bold=True, italic=True, size_pt=13)
-                    cur_d = diff
+        # Question header (page break before every question except first)
+        qh = doc.add_paragraph()
+        if not first:
+            qh.paragraph_format.page_break_before = True
+        qh.paragraph_format.space_before = Pt(0)
+        qh.paragraph_format.space_after  = Pt(2)
+        _s_run(qh, f"Question: {ws_q}", bold=True, size_pt=13)
 
-                # ── Question header (ONE page break per question) ──────────
-                ws_q += 1   # increment after possible chapter reset
-                qh = doc.add_paragraph()
-                if not first:
-                    qh.paragraph_format.page_break_before = True
-                    # Move topic/diff headings before qh if they were just added
-                    # (they'll flow after qh page break)
-                    # Restructure: insert topic/diff before qh in XML
-                    if topic != xl_rows[ri_list[0] if ri == ri_list[0] else ri]["_topic_norm"] if ri != ri_list[0] else False:
-                        pass
-                qh.paragraph_format.space_before = Pt(0)
-                qh.paragraph_format.space_after  = Pt(2)
-                _s_run(qh, f"Question: {ws_q}", bold=True, size_pt=13)
+        mp = doc.add_paragraph()
+        mp.paragraph_format.space_before = Pt(0)
+        mp.paragraph_format.space_after  = Pt(2)
+        _s_run(mp, "Level of question", bold=True, size_pt=11)
+        _s_run(mp, f": {diff}  |  ", size_pt=11)
+        _s_run(mp, "Number of Marks: ", bold=True, size_pt=11)
+        _s_run(mp, f"{marks}", size_pt=11)
 
-                mp = doc.add_paragraph()
-                mp.paragraph_format.space_before = Pt(0)
-                mp.paragraph_format.space_after  = Pt(2)
-                _s_run(mp, "Level of question", bold=True, size_pt=11)
-                _s_run(mp, f": {diff}  |  ", size_pt=11)
-                _s_run(mp, "Number of Marks: ", bold=True, size_pt=11)
-                _s_run(mp, f"{marks}", size_pt=11)
+        cp = doc.add_paragraph()
+        cp.paragraph_format.space_before = Pt(0)
+        cp.paragraph_format.space_after  = Pt(2)
+        _s_run(cp, "Chapter", bold=True, size_pt=11)
+        _s_run(cp, f" :  {topic}", size_pt=11)
+        _s_hr(doc, "BFBFBF")
 
-                cp = doc.add_paragraph()
-                cp.paragraph_format.space_before = Pt(0)
-                cp.paragraph_format.space_after  = Pt(2)
-                _s_run(cp, "Chapter", bold=True, size_pt=11)
-                _s_run(cp, f" :  {topic}", size_pt=11)
-                _s_hr(doc, "BFBFBF")
+        # QP content (text-first, image fallback)
+        _QP_MAX_H    = 1400
+        _QP_SAFE_1ST = 900
+        _qp_pieces_used = 0
 
-                # ── QP image (split across pages if too tall) ─────────────
-                # Safe page height for a QP image (content height minus header)
-                _QP_MAX_H    = 1400   # px at 150dpi  ≈ 504pt  → leaves room for header
-                _QP_SAFE_1ST = 900    # px — max for the first piece (header takes space)
+        if _qp_txt:
+            for _ln in _qp_txt.split("\n"):
+                _ln = _ln.strip()
+                if not _ln: continue
+                _is_max = bool(re.match(r"^\[\s*Maximum mark", _ln, re.I))
+                _is_qhd = bool(re.match(rf"^{qn}[.\s]", _ln))
+                _is_sub = bool(re.match(r"^[a-e][.)\s]|^\([a-e]\)", _ln))
+                _tp = doc.add_paragraph()
+                _tp.paragraph_format.space_before = Pt(4 if _is_max else 0)
+                _tp.paragraph_format.space_after  = Pt(2)
+                _tp.paragraph_format.left_indent  = Cm(0.5 if _is_sub else 0)
+                _s_run(_tp, _ln, bold=_is_max or _is_qhd, size_pt=10 if _is_max else 11)
+            if qp_img:
+                _s_add_img(doc, qp_img)
+            _qp_pieces_used = 1
+        elif qp_img:
+            qp_h = qp_img.height
+            if qp_h <= _QP_MAX_H:
+                _s_add_img(doc, qp_img)
+                _qp_pieces_used = 1
+            else:
+                qp_pieces = _s_split_smart(qp_img, max_h=_QP_SAFE_1ST)
+                for _pi3, qp_piece in enumerate(qp_pieces):
+                    if _pi3 > 0:
+                        _pb = doc.add_paragraph()
+                        _pb.paragraph_format.page_break_before = True
+                        _pb.paragraph_format.space_before = Pt(0)
+                        _pb.paragraph_format.space_after  = Pt(0)
+                    _s_add_img(doc, qp_piece)
+                _qp_pieces_used = len(qp_pieces)
+        else:
+            p = doc.add_paragraph()
+            _s_run(p, f"⚠ Q{qn} (p{pg}): content unavailable",
+                   italic=True, size_pt=10, color="CC0000")
 
-                if _qp_txt:
-                    # ── Text-first rendering ────────────────────────────────
-                    for _txt_line in _qp_txt.split("\n"):
-                        _txt_line = _txt_line.strip()
-                        if not _txt_line:
-                            continue
-                        _is_max = bool(re.match(r"^\[Maximum mark", _txt_line, re.I))
-                        _is_qhd = bool(re.match(rf"^{qn}[.\s]", _txt_line))
-                        _is_sub = bool(re.match(r"^[a-e][.)\s]|^\([a-e]\)", _txt_line))
-                        _tp = doc.add_paragraph()
-                        _tp.paragraph_format.space_before = Pt(4 if _is_max else 0)
-                        _tp.paragraph_format.space_after  = Pt(2)
-                        _tp.paragraph_format.left_indent  = Cm(0.5 if _is_sub else 0)
-                        _s_run(_tp, _txt_line, bold=_is_max or _is_qhd,
-                               size_pt=10 if _is_max else 11)
-                    # If there's also an image (diagrams), include it
-                    if qp_img:
-                        _s_add_img(doc, qp_img)
-                    _qp_pieces_used = 1
-                elif qp_img:
-                    # ── Image rendering ─────────────────────────────────────
-                    qp_h = qp_img.height
-                    if qp_h <= _QP_MAX_H:
-                        _s_add_img(doc, qp_img)
-                        _qp_pieces_used = 1
-                    else:
-                        qp_pieces = _s_split_smart(qp_img, max_h=_QP_SAFE_1ST)
-                        for pi_idx, qp_piece in enumerate(qp_pieces):
-                            if pi_idx > 0:
-                                _pb_qp = doc.add_paragraph()
-                                _pb_qp.paragraph_format.page_break_before = True
-                                _pb_qp.paragraph_format.space_before = Pt(0)
-                                _pb_qp.paragraph_format.space_after  = Pt(0)
-                            _s_add_img(doc, qp_piece)
-                        _qp_pieces_used = len(qp_pieces)
-                else:
-                    # Neither text nor image available — skip this question
-                    p = doc.add_paragraph()
-                    _s_run(p, f"⚠ Q{qn} (page {pg}): question content unavailable — skipped",
-                           italic=True, size_pt=10, color="CC0000")
-                    _qp_pieces_used = 0
+        # Student solution box
+        sol_separate = _qp_pieces_used > 1
+        if sol_separate or (qp_img and qp_img.height > _QP_MAX_H):
+            pb2 = doc.add_paragraph()
+            pb2.paragraph_format.page_break_before = True
+            pb2.paragraph_format.space_before = Pt(0)
+            pb2.paragraph_format.space_after  = Pt(0)
+        sl = doc.add_paragraph()
+        sl.paragraph_format.space_before = Pt(0 if (sol_separate or (qp_img and qp_img.height > _QP_MAX_H)) else 8)
+        sl.paragraph_format.space_after  = Pt(4)
+        sl.paragraph_format.keep_with_next = True
+        _s_run(sl, "Student's Solution:", bold=True, size_pt=11)
+        _s_sol_box(doc, n_sol)
 
-                # ── Student's Solution ────────────────────────────────────
-                # Always on a fresh page when image was split
-                if sol_separate or (qp_img and qp_img.height > _QP_MAX_H):
-                    pb2 = doc.add_paragraph()
-                    pb2.paragraph_format.page_break_before = True
-                    pb2.paragraph_format.space_before = Pt(0)
-                    pb2.paragraph_format.space_after  = Pt(0)
+        # MS page
+        pb3 = doc.add_paragraph()
+        pb3.paragraph_format.page_break_before = True
+        pb3.paragraph_format.space_before = Pt(0)
+        pb3.paragraph_format.space_after  = Pt(0)
+        ap = doc.add_paragraph()
+        ap.paragraph_format.space_before = Pt(0)
+        ap.paragraph_format.space_after  = Pt(4)
+        ap.paragraph_format.keep_with_next = True
+        _s_run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
-                sl = doc.add_paragraph()
-                sl.paragraph_format.space_before = Pt(0 if (sol_separate or (qp_img and qp_img.height > _QP_MAX_H)) else 8)
-                sl.paragraph_format.space_after  = Pt(4)
-                sl.paragraph_format.keep_with_next = True
-                _s_run(sl, "Student's Solution:", bold=True, size_pt=11)
-                _s_sol_box(doc, n_sol)
+        if ms_imgs:
+            for img in ms_imgs:
+                _s_add_ms_img(doc, img)
+            if ms_marks_mismatch:
+                _warn = doc.add_paragraph()
+                _warn.paragraph_format.space_before = Pt(2)
+                _warn.paragraph_format.space_after  = Pt(2)
+                _s_run(_warn,
+                       f"⚠ Marks mismatch: QP max={r.get('marks',0)} — verify manually.",
+                       italic=True, size_pt=9, color="CC6600")
+        else:
+            p = doc.add_paragraph()
+            _s_run(p, "⚠ Mark Scheme not found — please verify manually",
+                   italic=True, size_pt=10, color="CC0000")
 
-                # ── MS page (separate page) ───────────────────────────────
-                pb = doc.add_paragraph()
-                pb.paragraph_format.page_break_before = True
-                pb.paragraph_format.space_before = Pt(0)
-                pb.paragraph_format.space_after  = Pt(0)
+        # Keep it up
+        if quote:
+            _s_hr(doc, "BFBFBF")
+            kp = doc.add_paragraph()
+            kp.paragraph_format.space_before = Pt(4)
+            kp.paragraph_format.space_after  = Pt(0)
+            _s_run(kp, "Keep it up", bold=True, size_pt=11)
+            _s_run(kp, f" : {quote}", size_pt=11)
 
-                ap = doc.add_paragraph()
-                ap.paragraph_format.space_before = Pt(0)
-                ap.paragraph_format.space_after  = Pt(4)
-                ap.paragraph_format.keep_with_next = True
-                _s_run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
+        first    = False
+        done_qs += 1
+        if progress_cb:
+            progress_cb(done_qs, total_qs, f"Building Q{ws_q}…")
 
-                if ms_imgs:
-                    for img in ms_imgs:
-                        _s_add_ms_img(doc, img)
-                    # Show warning banner if marks total doesn't match
-                    if ms_marks_mismatch:
-                        _warn = doc.add_paragraph()
-                        _warn.paragraph_format.space_before = Pt(2)
-                        _warn.paragraph_format.space_after  = Pt(2)
-                        _s_run(_warn,
-                               f"⚠ Marks mismatch: QP max={r.get('marks',0)} "
-                               f"but MS total may differ. Verify manually.",
-                               italic=True, size_pt=9, color="CC6600")
-                else:
-                    # MS is empty — show placeholder but still include the question
-                    # (skipping entirely would cause gaps in question numbering)
-                    p = doc.add_paragraph()
-                    p.paragraph_format.space_before = Pt(0)
-                    p.paragraph_format.space_after  = Pt(2)
-                    _s_run(p, "⚠ Mark Scheme not found — please verify manually",
-                           italic=True, size_pt=10, color="CC0000")
-
-                # ── Keep it up (after MS, with HR) ─────────────────────────
-                if quote:
-                    _s_hr(doc, "BFBFBF")
-                    kp = doc.add_paragraph()
-                    kp.paragraph_format.space_before = Pt(4)
-                    kp.paragraph_format.space_after  = Pt(0)
-                    _s_run(kp, "Keep it up", bold=True, size_pt=11)
-                    _s_run(kp, f" : {quote}", size_pt=11)
-
-                first   = False
-                done_qs += 1
-                if progress_cb:
-                    progress_cb(done_qs, total_qs, f"Building Q{ws_q}…")
 
     qp_doc.close()
     ms_doc.close()
