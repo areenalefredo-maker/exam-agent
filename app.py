@@ -1930,12 +1930,12 @@ def _extract_ms_text(ms_doc, start_pi: int, end_pi: int,
 
 def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
     """
-    Render a clean MS page by:
-    1. Redacting the Question-number column (x=0..137 in PDF points)
-    2. Redacting headers: Section A/B, Question/Answers/Notes/Total row,
-       page numbers, (Question N continued), Turn over
-    3. Cropping the rendered image to its content bounding box
-    Returns a PIL Image.
+    Render a clean MS page:
+    - Removes "Question" column header
+    - Removes "N." prefix from "N. a" entries, keeps sub-part letter visible
+    - Removes page headers/footers, "Section A", "(Question N continued)", "Turn over"
+    - Keeps: Answers / Notes / Total headers, marks (1 / 2 max / 3 max), all answer content
+    Uses rawdict chars[] for precise character-level redaction.
     """
     import fitz as _fitz
     from PIL import Image as _Image
@@ -1943,83 +1943,123 @@ def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
     import numpy as _np
     import re as _re
 
-    _Q_COL_RIGHT = 137   # PDF points — right edge of Question column
+    tmp = _fitz.open()
+    tmp.insert_pdf(ms_doc, from_page=pi, to_page=pi)
+    pg  = tmp[0]
+    ph  = pg.rect.height
+    pw  = pg.rect.width
+    rects = []
 
-    # Work on an in-memory copy so original PDF is not modified
-    _tmp = _fitz.open()
-    _tmp.insert_pdf(ms_doc, from_page=pi, to_page=pi)
-    _pg = _tmp[0]
-    _ph = _pg.rect.height
-    _pw = _pg.rect.width
-
-    _rects = []
-
-    # Always redact the full Question-number column + its border
-    _rects.append(_fitz.Rect(0, 0, _Q_COL_RIGHT, _ph))
-
-    # Scan all text lines for things to redact
-    for _blk in _pg.get_text("dict").get("blocks", []):
-        if _blk.get("type") != 0:
+    # ── Pass 1: use rawdict for character-level Q-column redaction ────────
+    for blk in pg.get_text("rawdict").get("blocks", []):
+        if blk.get("type") != 0:
             continue
-        for _ln in _blk.get("lines", []):
-            _spans = _ln.get("spans", [])
-            _txt   = "".join(s.get("text", "") for s in _spans).strip()
-            _bb    = _ln["bbox"]
-            _x0, _y0, _x1, _y1 = _bb
+        for ln in blk.get("lines", []):
+            for sp in ln.get("spans", []):
+                bb    = sp.get("bbox", [0, 0, 0, 0])
+                x0, y0, x1, y1 = bb
+                chars = sp.get("chars", [])
 
-            # Section A/B header
-            if _re.match(r"^Section\s+[AB]$", _txt, _re.I):
-                _rects.append(_fitz.Rect(0, _y0 - 3, _pw, _y1 + 5))
+                # Only process Q-column entries in content area
+                if x0 >= 135 or y0 < ph * 0.10 or y0 > ph * 0.92:
+                    continue
+                if not chars:
+                    continue
 
-            # Table header row (Question | Answers | Notes | Total)
-            elif _txt in ("Question", "Answers", "Notes", "Total"):
-                _rects.append(_fitz.Rect(0, _y0 - 3, _pw, _y1 + 5))
+                char_texts = [c.get("c", "") for c in chars]
+                char_str   = "".join(char_texts).strip()
 
-            # (Question N continued) / "continued" / "Turn over"
-            elif _re.search(
-                r"[Qq]uestion\s+\d+\s+continued"
-                r"|\(?continued\.?\)?"
-                r"|^Turn\s+over$",
-                _txt, _re.I
+                # "Question" header → redact entire span
+                if char_str in ("Question", "question"):
+                    rects.append(_fitz.Rect(x0 - 2, y0 - 2, x1 + 2, y1 + 2))
+                    continue
+
+                # "N. a" pattern → find first alpha char at x > 92, redact before it
+                if _re.match(r"^\d{1,2}\.?\s*[a-z]?\s*$", char_str):
+                    letter_x = None
+                    for ch in chars:
+                        c_char = ch.get("c", "")
+                        c_bb   = ch.get("bbox", [0, 0, 0, 0])
+                        # Sub-part letter is alphabetic and to the right of "N. "
+                        if c_char.isalpha() and c_bb[0] > 92:
+                            letter_x = c_bb[0] - 2   # 2px margin before letter
+                            break
+
+                    if letter_x:
+                        # Redact from left edge up to (but not including) the letter
+                        rects.append(_fitz.Rect(0, y0 - 2, letter_x, y1 + 2))
+                    else:
+                        # No letter found → redact entire span (pure number like "1.")
+                        rects.append(_fitz.Rect(0, y0 - 2, x1 + 2, y1 + 2))
+                    continue
+
+    # ── Pass 2: use dict for line-level text redactions ───────────────────
+    for blk in pg.get_text("dict").get("blocks", []):
+        if blk.get("type") != 0:
+            continue
+        for ln in blk.get("lines", []):
+            txt  = "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+            lbb  = ln["bbox"]
+            lx0, ly0, lx1, ly1 = lbb
+
+            # Page header (– N – / YYYYM / ©)
+            if ly0 < ph * 0.10 and _re.search(
+                r"–\s*\d+\s*–|\d{4}[\-–]\d{4}M?|©", txt
             ):
-                _rects.append(_fitz.Rect(0, _y0 - 2, _pw, _y1 + 3))
+                rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
+                continue
 
-            # Page header/footer: –N– or YYYYM or plain number
-            elif (_y0 < _ph * 0.12 and
-                  _re.search(r"–\s*\d+\s*–|\d{4}[\-–]\d{4}M?|©", _txt)):
-                _rects.append(_fitz.Rect(0, _y0 - 2, _pw, _y1 + 3))
-            elif _y0 > _ph * 0.90 and _re.match(r"^\d{1,4}$", _txt):
-                _rects.append(_fitz.Rect(0, _y0 - 2, _pw, _y1 + 3))
+            # Page footer (bare page number)
+            if ly0 > ph * 0.90 and _re.match(r"^\d{1,4}$", txt):
+                rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
+                continue
 
-    for _r in _rects:
+            # "Section A" / "Section B" page-level label
+            if _re.match(r"^Section\s+[AB]$", txt, _re.I) and ly0 < ph * 0.20:
+                rects.append(_fitz.Rect(0, ly0 - 3, pw, ly1 + 4))
+                continue
+
+            # "(Question N continued)"
+            if _re.search(r"\(?[Qq]uestion\s+\d+\s+continued\)?", txt, _re.I):
+                rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
+                continue
+
+            # "Turn over"
+            if _re.match(r"^Turn\s+over$", txt, _re.I):
+                rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
+                continue
+
+    # ── Apply redactions ──────────────────────────────────────────────────
+    for rect in rects:
         try:
-            _pg.add_redact_annot(_r, fill=(1, 1, 1))
+            pg.add_redact_annot(rect, fill=(1, 1, 1))
         except Exception:
             pass
     try:
-        _pg.apply_redactions()
+        pg.apply_redactions()
     except Exception:
         pass
 
-    # Render
-    _pix = _pg.get_pixmap(matrix=_fitz.Matrix(scale, scale), alpha=False)
-    _img = _Image.open(_io.BytesIO(_pix.tobytes("png"))).copy()
-    _tmp.close()
+    # ── Render ────────────────────────────────────────────────────────────
+    pix = pg.get_pixmap(matrix=_fitz.Matrix(scale, scale), alpha=False)
+    img = _Image.open(_io.BytesIO(pix.tobytes("png"))).copy()
+    tmp.close()
 
     # Auto-trim to content bounding box
-    _arr = _np.array(_img)
-    _rm  = _arr.min(axis=(1, 2))   # row darkness
-    _cm  = _arr.min(axis=(0, 2))   # col darkness
-    _dr  = _np.where(_rm < 248)[0]
-    _dc  = _np.where(_cm < 248)[0]
-    if len(_dr) and len(_dc):
-        top   = max(0,           int(_dr[0])  - 8)
-        bot   = min(_img.height, int(_dr[-1]) + 15)
-        left  = max(0,           int(_dc[0])  - 8)
-        right = min(_img.width,  int(_dc[-1]) + 15)
-        _img  = _img.crop((left, top, right, bot))
+    arr = _np.array(img)
+    rm  = arr.min(axis=(1, 2))
+    cm  = arr.min(axis=(0, 2))
+    dr  = _np.where(rm < 248)[0]
+    dc  = _np.where(cm < 248)[0]
+    if len(dr) and len(dc):
+        top   = max(0,           int(dr[0])  - 8)
+        bot   = min(img.height,  int(dr[-1]) + 15)
+        left  = max(0,           int(dc[0])  - 8)
+        right = min(img.width,   int(dc[-1]) + 15)
+        img   = img.crop((left, top, right, bot))
 
-    return _img
+    return img
+
 
 
 def _crop_ms_biology_range(ms_doc: "fitz.Document",
