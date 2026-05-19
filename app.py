@@ -1514,9 +1514,10 @@ def _find_q_in_section_pages(ms_doc, sec, qn):
     Returns a minimal q_info dict if found, else None.
     """
     qs_sorted    = sorted(sec.get("questions", {}).keys())
-    sec_start_pi = sec.get("start_pg", 1) - 1
+    sec_start_pi = sec.get("start_page", sec.get("start_pg", 1)) - 1
     if qs_sorted:
-        last_pi = sec["questions"][qs_sorted[-1]]
+        _last_q_info = sec["questions"][qs_sorted[-1]]
+        last_pi = (_last_q_info["page_idx"] if isinstance(_last_q_info, dict) else int(_last_q_info))
         end_pi  = last_pi + 10
     else:
         end_pi  = sec_start_pi + 25
