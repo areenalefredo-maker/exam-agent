@@ -1618,6 +1618,49 @@ def _extract_answer_keywords(excel_ms_text: str) -> list[str]:
     return list(set(nums[:8] + words[:5]))
 
 
+def find_biology_ms_q_boundaries(ms_doc, session_start_pi: int,
+                                   session_end_pi: int) -> dict:
+    """
+    For Biology table-format MS, scan pages and detect where each question's
+    answers start and end by finding the FIRST appearance of "N. X" (question N,
+    part X) on each page.  Returns {qn: (start_pi, end_pi)}.
+
+    Stops question N's range when question N+1 first appears.
+    """
+    import re as _re
+
+    # Map: qn → first page index where that Q number appears
+    q_first: dict[int, int] = {}
+
+    for pi in range(session_start_pi, min(session_end_pi + 1, len(ms_doc))):
+        txt = ms_doc[pi].get_text()
+        # Match patterns like "1. a", "2. b", "10. c" at start of line
+        for m in _re.finditer(
+            r"(?:^|\n)\s*(\d{1,2})\s*\.\s+[a-z]",
+            txt, _re.MULTILINE
+        ):
+            qn = int(m.group(1))
+            if 1 <= qn <= 15 and qn not in q_first:
+                q_first[qn] = pi
+
+    if not q_first:
+        return {}
+
+    q_sorted = sorted(q_first.keys())
+    boundaries: dict[int, tuple[int, int]] = {}
+    for i, qn in enumerate(q_sorted):
+        start = q_first[qn]
+        if i + 1 < len(q_sorted):
+            # End = page BEFORE next question starts (or same page if they share)
+            next_start = q_first[q_sorted[i + 1]]
+            end = max(start, next_start - 1)
+        else:
+            end = session_end_pi
+        boundaries[qn] = (start, end)
+
+    return boundaries
+
+
 def _find_ms_section_by_keywords(ms_doc, ms_sections, keywords: list[str],
                                   qn: int, qp_max_mark: int = 0) -> tuple:
     """
@@ -2161,25 +2204,51 @@ def build_structured_worksheet(
                     "marker_right_x": 0,
                 }
             if q_info:
-                # Extend to [Total:] marker for complete MS
-                _qi = dict(q_info)
+                # ── Biology-boundary crop (highest priority) ─────────────────
+                # Use find_biology_ms_q_boundaries to get exact per-question
+                # page ranges: continues until the NEXT question starts.
+                _bio_start = q_info["page_idx"]
+                _bio_end   = q_info.get("end_page_idx", _bio_start)
+                # Search session boundaries: look ±20 pages around q_info
+                _sess_start = max(0, _bio_start - 5)
+                _sess_end   = min(len(ms_doc) - 1, _bio_end + 25)
+                _bio_bounds = find_biology_ms_q_boundaries(
+                    ms_doc, _sess_start, _sess_end
+                )
+                if qn in _bio_bounds:
+                    _bs, _be = _bio_bounds[qn]
+                    q_info = dict(q_info)
+                    q_info["page_idx"]     = _bs
+                    q_info["end_page_idx"] = _be
+                    q_info["top_y"]        = ms_doc[_bs].rect.height * 0.03
+                    q_info["end_y"]        = ms_doc[_be].rect.height * 0.97
+
+                # Extend to [Total:] marker (extra safety for math-style MS)
+                _qi   = dict(q_info)
                 _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
                 for _ex in range(8):
                     _tpi = _epi0 + _ex
                     if _tpi >= len(ms_doc): break
-                    if re.search(r"Total[:\s]", ms_doc[_tpi].get_text(), re.I):
-                        _qi["end_page_idx"] = _tpi
-                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.96
+                    _t2 = ms_doc[_tpi].get_text()
+                    # Stop extending if next question starts
+                    if re.search(rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]",
+                                 _t2, re.MULTILINE):
                         break
-                # Primary crop (math-style MS)
-                pieces = _crop_ms_pieces(ms_doc, _qi)
-                # Fallback: Biology-style table MS — use range crop
+                    if re.search(r"Total[:\s]", _t2, re.I):
+                        _qi["end_page_idx"] = _tpi
+                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.97
+                        break
+
+                # Primary crop (biology range → most reliable)
+                pieces = _crop_ms_biology_range(
+                    ms_doc,
+                    _qi["page_idx"],
+                    _qi.get("end_page_idx", _qi["page_idx"]),
+                )
+                # Fallback: math-style crop if biology range fails
                 if not pieces or sum(p.height for p in pieces) < 80:
-                    pieces = _crop_ms_biology_range(
-                        ms_doc,
-                        _qi["page_idx"],
-                        _qi.get("end_page_idx", _qi["page_idx"]),
-                    )
+                    pieces = _crop_ms_pieces(ms_doc, _qi)
+
                 # Validate marks total
                 if pieces:
                     qp_max_mark = r.get("marks", 0) or 0
@@ -2187,15 +2256,17 @@ def build_structured_worksheet(
                         _ms_combo = ""
                         try:
                             for _pi2 in range(_qi["page_idx"],
-                                              min(_qi.get("end_page_idx", _qi["page_idx"]) + 1,
+                                              min(_qi.get("end_page_idx",
+                                                          _qi["page_idx"]) + 1,
                                                   len(ms_doc))):
                                 _ms_combo += ms_doc[_pi2].get_text()
                         except Exception:
                             pass
-                        _tm = re.search(r"Total[:\s]+(\d+)\s*marks?", _ms_combo, re.I)
+                        _tm = re.search(r"Total[:\s]+(\d+)\s*marks?",
+                                        _ms_combo, re.I)
                         if _tm and abs(int(_tm.group(1)) - qp_max_mark) > 2:
                             ms_marks_mismatch = True
-                # ← Always set ms_imgs regardless of which path was taken
+                # ← Always set ms_imgs regardless of path
                 ms_imgs = pieces
 
         # Skip question if no QP content and no MS content
