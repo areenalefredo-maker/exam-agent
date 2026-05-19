@@ -1808,6 +1808,148 @@ def _clean_ms_image(img, page, scale: float = 150/72,
     return img
 
 
+def _extract_ms_text(ms_doc, start_pi: int, end_pi: int,
+                      qn: int) -> list | None:
+    """
+    Extract Mark Scheme content as structured text from Biology-style table MS.
+    Returns list of dicts [{part, answer, notes, total}] or None if content
+    contains equations/diagrams that require image rendering.
+    
+    Skips: question numbers, "Section A/B", column headers, 
+           "continued", "Turn over", page numbers.
+    """
+    import re as _re
+
+    # Column boundaries (PDF points) — standard IB Biology MS layout
+    ANS_L   = 130    # Answers column starts
+    NOTES_L = 545    # Notes column starts
+    TOTAL_L = 730    # Total column starts
+    ROW_H   = 14     # Approximate row height for bucketing
+
+    rows = {}   # y_bucket → {q, ans, notes, total}
+
+    for pi in range(start_pi, min(end_pi + 1, len(ms_doc))):
+        page = ms_doc[pi]
+        ph   = page.rect.height
+        pw   = page.rect.width
+
+        # Check for image blocks → needs image rendering
+        _ph2 = page.rect.height
+        for blk in page.get_text("dict").get("blocks", []):
+            if blk.get("type") == 1:   # image block
+                _bb2 = blk.get("bbox", [0, 0, 0, 0])
+                # Only bail if image is in content area (not header/footer)
+                if _bb2[1] > _ph2 * 0.10 and _bb2[3] < _ph2 * 0.93:
+                    return None        # has actual diagram/equation image
+
+        for blk in page.get_text("dict").get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    txt = sp.get("text", "").strip()
+                    if not txt:
+                        continue
+                    bb  = sp.get("bbox", [])
+                    x0, y0, x1, y1 = bb
+
+                    # Skip page headers / footers / outside content area
+                    if y0 < ph * 0.10 or y0 > ph * 0.93:
+                        continue
+
+                    # Skip "Section A/B" and column header row
+                    if _re.match(r"^Section\s+[AB]$", txt, _re.I):
+                        continue
+                    if txt in ("Question", "Answers", "Notes", "Total"):
+                        continue
+
+                    # Skip "(continued…)" / "Turn over" / "continued"
+                    if _re.search(
+                        r"[Qq]uestion\s+\d+\s+continued"
+                        r"|\(?continued[^a-z]|^Turn\s+over$",
+                        txt, _re.I
+                    ):
+                        continue
+
+                    # Skip page number at far right on same row as header
+                    if x0 > TOTAL_L and _re.match(r"^\d{1,4}$", txt) and y0 < ph * 0.15:
+                        continue
+
+                    # Bucket by y-position (each row ~14pt tall)
+                    y_key = int(y0 / ROW_H) * ROW_H
+
+                    if y_key not in rows:
+                        rows[y_key] = {"q": [], "ans": [], "notes": [], "total": []}
+
+                    if x0 < ANS_L:
+                        rows[y_key]["q"].append(txt)
+                    elif x0 < NOTES_L:
+                        rows[y_key]["ans"].append(txt)
+                    elif x0 < TOTAL_L:
+                        rows[y_key]["notes"].append(txt)
+                    else:
+                        rows[y_key]["total"].append(txt)
+
+    if not rows:
+        return None
+
+    # Check for many non-ASCII chars (equations/formulas) → needs image
+    all_ans_text = " ".join(
+        " ".join(r["ans"]) for r in rows.values()
+    )
+    non_ascii = sum(1 for c in all_ans_text if ord(c) > 127)
+    if len(all_ans_text) > 20 and non_ascii / len(all_ans_text) > 0.20:
+        return None   # too many math symbols
+
+    # Build structured output
+    result   = []
+    cur_part = ""
+    cur_ans  = []
+    cur_notes= []
+    cur_total= ""
+
+    def flush(part, ans, notes, total):
+        ans_str   = " ".join(ans).strip()
+        notes_str = " ".join(notes).strip()
+        if ans_str or notes_str:
+            result.append({
+                "part":  part,
+                "ans":   ans_str,
+                "notes": notes_str,
+                "total": total,
+            })
+
+    for y_key in sorted(rows):
+        r = rows[y_key]
+        q_txt  = " ".join(r["q"]).strip()
+        ans_txt= " ".join(r["ans"]).strip()
+        tot_txt= " ".join(r["total"]).strip()
+        not_txt= " ".join(r["notes"]).strip()
+
+        # New question part starts when Q column has content
+        if q_txt:
+            if cur_ans or cur_notes:
+                flush(cur_part, cur_ans, cur_notes, cur_total)
+            # Extract sub-part letter from "1. a" or "a" 
+            m = _re.search(r"(\d{1,2})\.\s*([a-z])|^([a-z])$", q_txt)
+            if m:
+                cur_part = m.group(2) or m.group(3) or q_txt
+            else:
+                cur_part = q_txt
+            cur_ans   = [ans_txt] if ans_txt else []
+            cur_notes = [not_txt] if not_txt else []
+            cur_total = tot_txt
+        else:
+            if ans_txt:  cur_ans.append(ans_txt)
+            if not_txt:  cur_notes.append(not_txt)
+            if tot_txt and not cur_total:  cur_total = tot_txt
+
+    if cur_ans or cur_notes:
+        flush(cur_part, cur_ans, cur_notes, cur_total)
+
+    return result if result else None
+
+
 def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
     """
     Render a clean MS page by:
@@ -2409,16 +2551,78 @@ def build_structured_worksheet(
         ap.paragraph_format.keep_with_next = True
         _s_run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
-        if ms_imgs:
-            for img in ms_imgs:
-                _s_add_ms_img(doc, img)
-            if ms_marks_mismatch:
-                _warn = doc.add_paragraph()
-                _warn.paragraph_format.space_before = Pt(2)
-                _warn.paragraph_format.space_after  = Pt(2)
-                _s_run(_warn,
-                       f"⚠ Marks mismatch: QP max={r.get('marks',0)} — verify manually.",
-                       italic=True, size_pt=9, color="CC6600")
+        if ms_imgs or row_to_section.get(ri):
+            # ── Try text extraction first ────────────────────────────────
+            _ms_sec = row_to_section.get(ri)
+            _ms_text_entries = None
+            if _ms_sec and isinstance(_ms_sec, dict):
+                _q_inf2 = _ms_sec.get("questions", {}).get(qn)
+                if _q_inf2:
+                    _ts = _q_inf2.get("page_idx", 0)
+                    _te = _q_inf2.get("end_page_idx", _ts)
+                    _ms_text_entries = _extract_ms_text(ms_doc, _ts, _te, qn)
+
+            if _ms_text_entries:
+                # ── Render as formatted text paragraphs ──────────────────
+                for _entry in _ms_text_entries:
+                    _part  = _entry.get("part", "")
+                    _ans   = _entry.get("ans", "")
+                    _notes = _entry.get("notes", "")
+                    _tot   = _entry.get("total", "")
+
+                    _row_p = doc.add_paragraph()
+                    _row_p.paragraph_format.space_before = Pt(0)
+                    _row_p.paragraph_format.space_after  = Pt(3)
+                    _row_p.paragraph_format.left_indent  = Cm(0)
+
+                    # Part letter (bold)
+                    if _part:
+                        _s_run(_row_p, f"({_part})", bold=True, size_pt=10)
+                        _s_run(_row_p, "  ", size_pt=10)
+
+                    # Answer text
+                    if _ans:
+                        _s_run(_row_p, _ans, size_pt=10)
+
+                    # Notes (italic, smaller)
+                    if _notes:
+                        _note_p = doc.add_paragraph()
+                        _note_p.paragraph_format.space_before = Pt(0)
+                        _note_p.paragraph_format.space_after  = Pt(1)
+                        _note_p.paragraph_format.left_indent  = Cm(0.6)
+                        _s_run(_note_p, f"[{_notes}]", italic=True,
+                               size_pt=9, color="555555")
+
+                    # Total marks (right-aligned hint)
+                    if _tot and _tot not in ("0", ""):
+                        _tot_p = doc.add_paragraph()
+                        _tot_p.paragraph_format.space_before = Pt(0)
+                        _tot_p.paragraph_format.space_after  = Pt(4)
+                        _tot_p.paragraph_format.alignment    = 2  # right
+                        _s_run(_tot_p, f"[{_tot}]", bold=True, size_pt=10,
+                               color="444444")
+
+                if ms_marks_mismatch:
+                    _warn = doc.add_paragraph()
+                    _s_run(_warn,
+                           f"⚠ Marks mismatch: QP max={r.get('marks',0)} — verify.",
+                           italic=True, size_pt=9, color="CC6600")
+
+            elif ms_imgs:
+                # ── Fall back to image rendering ──────────────────────────
+                for img in ms_imgs:
+                    _s_add_ms_img(doc, img)
+                if ms_marks_mismatch:
+                    _warn = doc.add_paragraph()
+                    _warn.paragraph_format.space_before = Pt(2)
+                    _warn.paragraph_format.space_after  = Pt(2)
+                    _s_run(_warn,
+                           f"⚠ Marks mismatch: QP max={r.get('marks',0)} — verify.",
+                           italic=True, size_pt=9, color="CC6600")
+            else:
+                p = doc.add_paragraph()
+                _s_run(p, "⚠ Mark Scheme not found — please verify manually",
+                       italic=True, size_pt=10, color="CC0000")
         else:
             p = doc.add_paragraph()
             _s_run(p, "⚠ Mark Scheme not found — please verify manually",
