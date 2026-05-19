@@ -754,18 +754,110 @@ def extract_answers(client, ms_b64, q_nums, ms_bytes=None) -> dict:
 #  STRUCTURED MS — SECTION DETECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 def _detect_paper_code(text: str) -> str | None:
+    """
+    Extract a normalized paper code from PDF text.
+    Works for any IB subject: Math, Biology, Chemistry, etc.
+    Returns a code like "M23/HL/P2/TZ1" or None.
+    """
     if not text:
         return None
-    m = re.search(r'([MN])(\d{2})/\d/MATH\w+/([HS])P(\d)/\w+/(TZ\d|TZ0)', text)
+    # Pattern 1: Full IB code like M21/4/BIOLO/HP2/ENG/TZ1/XX
+    m = re.search(
+        r"([MN])(\d{2})/\d/\w+/([HS])P(\d)/\w+/(TZ[\d0]|XX)",
+        text, re.IGNORECASE
+    )
     if m:
         session, year, level, paper, tz = m.groups()
-        return f"{session}{year}/{level}P{paper}/{tz}"
-    m = re.search(r'\b(\d{4})\s*[\-–]\s*(\d{4})\b', text)
-    if m:
-        return f"{m.group(1)}-{m.group(2)}"
+        lv = "HL" if level.upper() == "H" else "SL"
+        tz_str = tz.upper() if tz.upper() != "XX" else "TZ0"
+        return f"{session}{year}/{lv}/P{paper}/{tz_str}"
+    # Pattern 2: 4-digit code like 2221-7210 or 8825-7310
+    m2 = re.search(r"(\d{4})[\-\u2013](\d{4})", text)
+    if m2:
+        return f"CODE-{m2.group(1)}-{m2.group(2)}"
+    # Pattern 3: "May 2023 Paper 2 Higher Level"
+    m3 = re.search(
+        r"(May|November|March)\s+(\d{4}).*?[Pp]aper\s*(\d).*?(Higher|Standard)\s*[Ll]evel",
+        text, re.DOTALL
+    )
+    if m3:
+        month, year, paper, level = m3.groups()
+        lv = "HL" if "Higher" in level else "SL"
+        session = "M" if month == "May" else ("N" if month == "November" else "R")
+        return f"{session}{year[2:]}/{lv}/P{paper}"
     return None
 
 
+def _extract_paper_meta(pdf_bytes: bytes, n_pages_check: int = 10) -> dict:
+    """
+    Extract subject, level, paper number, year, session, timezone from a PDF.
+    Returns a dict with keys: subject, level, paper, year, session, tz, code.
+    """
+    meta = {"subject":"","level":"","paper":"","year":"","session":"","tz":"","code":""}
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        # Check first few pages for cover page info
+        for pi in range(min(n_pages_check, len(doc))):
+            txt = doc[pi].get_text()
+            # Subject
+            for subj in ["Biology","Chemistry","Physics","Mathematics","Economics",
+                         "History","Geography","Computer Science","Psychology"]:
+                if subj.lower() in txt.lower():
+                    meta["subject"] = subj; break
+            # Level
+            if "higher level" in txt.lower(): meta["level"] = "HL"
+            elif "standard level" in txt.lower(): meta["level"] = "SL"
+            # Paper
+            m_paper = re.search(r"[Pp]aper\s*(\d)", txt)
+            if m_paper: meta["paper"] = m_paper.group(1)
+            # Year + Session
+            m_date = re.search(r"(May|November|March)\s+(\d{4})", txt)
+            if m_date:
+                meta["session"] = m_date.group(1)
+                meta["year"]    = m_date.group(2)
+            # Timezone
+            m_tz = re.search(r"(TZ\d|timezone\s*\d)", txt, re.I)
+            if m_tz: meta["tz"] = m_tz.group(1).upper().replace(" ","").replace("TIMEZONE","TZ")
+            # Paper code
+            code = _detect_paper_code(txt)
+            if code and not meta["code"]: meta["code"] = code
+            if all(meta[k] for k in ["subject","level","paper","year"]): break
+        doc.close()
+    except Exception:
+        pass
+    return meta
+
+
+def _verify_qp_ms_match(qp_bytes: bytes, ms_bytes: bytes) -> tuple[bool, str]:
+    """
+    Verify that QP and MS PDFs match (same subject/level/paper/year/session/tz).
+    Returns (match: bool, message: str).
+    """
+    qp_meta = _extract_paper_meta(qp_bytes)
+    ms_meta  = _extract_paper_meta(ms_bytes)
+
+    mismatches = []
+    for key in ["subject","level","paper","year"]:
+        qv = qp_meta.get(key,"").strip()
+        mv = ms_meta.get(key,"").strip()
+        if qv and mv and qv.lower() != mv.lower():
+            mismatches.append(f"{key}: QP='{qv}' vs MS='{mv}'")
+
+    # Timezone check (optional — only fail if both specify and differ)
+    qtz = qp_meta.get("tz","")
+    mtz = ms_meta.get("tz","")
+    if qtz and mtz and qtz != mtz and qtz != "TZ0" and mtz != "TZ0":
+        mismatches.append(f"timezone: QP='{qtz}' vs MS='{mtz}'")
+
+    if mismatches:
+        return False, ("❌ QP and Mark Scheme do not match:\n" +
+                       "\n".join(f"  • {m}" for m in mismatches))
+
+    summary = (f"✅ QP ↔ MS verified: {qp_meta.get('subject','')} "
+               f"{qp_meta.get('level','')} Paper {qp_meta.get('paper','')} "
+               f"{qp_meta.get('session','')} {qp_meta.get('year','')} "
+               f"{qp_meta.get('tz','')}")
+    return True, summary.strip()
 def _build_page_to_paper_map(pdf_bytes: bytes) -> dict:
     try:
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -1034,6 +1126,72 @@ _S_FOOTER_PAT  = re.compile(
 _MS_FT  = re.compile(r"(M\d{2}/\d/|N\d{2}/\d/|©\s*\d{4}|international\s+baccalaureate)", re.I)
 _MS_BN  = re.compile(r"^\s*\d{1,3}\s*$")
 _MS_HDR = re.compile(r"(^\s*[–\-]\s*\d{1,3}\s*[–\-]\s*$|M\d{2}/\d/|N\d{2}/\d/)", re.I)
+
+
+def _extract_qp_text(qp_doc, pg: int, qn: int) -> str | None:
+    """
+    Extract the text of question qn from QP page pg.
+    Returns clean text if the question is text-only, else None (use image).
+    Heuristic: if >40% of content is non-ASCII or there are image blocks, use image.
+    """
+    try:
+        page = qp_doc[pg - 1]
+        td   = page.get_text("dict")
+        blocks = td.get("blocks", [])
+        # Check for image blocks (type=1 = image)
+        has_images = any(b.get("type") == 1 for b in blocks)
+        # Check for drawing objects (figures/diagrams)
+        clip_svg  = page.get_svg_image()
+        has_drawings = len(clip_svg) > 2000 and "<path" in clip_svg
+
+        if has_images or has_drawings:
+            return None   # Use image
+
+        # Extract all text lines after the question marker
+        ph = page.rect.height
+        lines_out = []
+        in_q = False
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                if not spans:
+                    continue
+                txt = "".join(s.get("text", "") for s in spans).strip()
+                if not txt:
+                    continue
+                bb = line["bbox"]
+                # Detect question marker
+                if re.match(rf"^{qn}[.\s]", txt) and bb[0] < 70:
+                    in_q = True
+                    # Include [Maximum mark] on same line
+                    lines_out.append(txt)
+                    continue
+                # Stop at next question
+                if in_q and re.match(r"^\d{1,2}[.\s]", txt) and bb[0] < 70:
+                    m_next = re.match(r"^(\d{1,2})", txt)
+                    if m_next and int(m_next.group(1)) > qn:
+                        break
+                # Skip footers
+                if bb[1] > ph * 0.90:
+                    continue
+                # Skip writing lines (dots/underscores)
+                if _s_is_writing_line(txt):
+                    continue
+                if in_q:
+                    lines_out.append(txt)
+
+        if not lines_out:
+            return None
+        result = "\n".join(lines_out)
+        # If >25% non-ASCII → likely formula-heavy → use image
+        non_ascii = sum(1 for c in result if ord(c) > 127)
+        if len(result) > 0 and non_ascii / len(result) > 0.25:
+            return None
+        return result
+    except Exception:
+        return None
 
 
 def _s_trim_bottom(img, thr=248):
@@ -1786,6 +1944,26 @@ def build_structured_worksheet(
 ) -> bytes:
     """Generate the structured worksheet using the FINAL AGENT layout."""
 
+    # ── Pre-generation validation ────────────────────────────────────────────
+    _validation_errors = []
+    for _vr in xl_rows:
+        _vpg = _vr.get("page_num", 0)
+        _vqn = _vr.get("qn", 0)
+        _vmk = _vr.get("marks", 0)
+        _vtopic = (_vr.get("_topic_norm") or _vr.get("topic") or "")
+        if _vpg <= 0:
+            _validation_errors.append(f"  • Q{_vqn}: page_num missing")
+        if _vmk <= 0:
+            _validation_errors.append(f"  • Q{_vqn}: marks unknown")
+
+    if _validation_errors and len(_validation_errors) > len(xl_rows) * 0.5:
+        # More than 50% of rows are invalid — raise early
+        raise ValueError(
+            "Worksheet validation failed — too many invalid rows:\n" +
+            "\n".join(_validation_errors[:10]) +
+            ("\n  ..." if len(_validation_errors) > 10 else "")
+        )
+
     qp_doc = fitz.open(stream=qp_bytes, filetype="pdf")
     ms_doc = fitz.open(stream=ms_bytes, filetype="pdf")
 
@@ -1868,6 +2046,8 @@ def build_structured_worksheet(
                 # Crop QP (pass pg_end so multi-page questions are complete)
                 pg_end = r.get("page_num_end", 0) or 0
                 qp_img = _crop_qp_full(qp_doc, pg, qn, pg_end=pg_end)
+                # Try text extraction (text-first for non-diagram questions)
+                _qp_txt = _extract_qp_text(qp_doc, pg, qn) if pg > 0 else None
 
                 # Crop MS
                 sec     = row_to_section.get(ri)
@@ -1910,7 +2090,20 @@ def build_structured_worksheet(
                             "marker_right_x": 0,
                         }
                     if q_info:
-                        pieces = _crop_ms_pieces(ms_doc, q_info)
+                        # Ensure complete MS: extend end_page_idx until [Total:] found
+                        _q_info_ext = dict(q_info)
+                        _max_mark   = r.get("marks", 0) or 0
+                        _epi_orig   = _q_info_ext.get("end_page_idx", _q_info_ext["page_idx"])
+                        for _extra in range(0, 6):
+                            _test_pi = _epi_orig + _extra
+                            if _test_pi >= len(ms_doc):
+                                break
+                            _test_txt = ms_doc[_test_pi].get_text()
+                            if re.search(r"\[Total[:\s]", _test_txt, re.I):
+                                _q_info_ext["end_page_idx"] = _test_pi
+                                _q_info_ext["end_y"]        = ms_doc[_test_pi].rect.height * 0.95
+                                break   # found Total marker
+                        pieces = _crop_ms_pieces(ms_doc, _q_info_ext)
                         if pieces:
                             # ── Max-mark validation ───────────────────────────────
                             # Check if [Total: N marks] in MS matches QP maximum mark.
@@ -1999,20 +2192,35 @@ def build_structured_worksheet(
                 _QP_MAX_H    = 1400   # px at 150dpi  ≈ 504pt  → leaves room for header
                 _QP_SAFE_1ST = 900    # px — max for the first piece (header takes space)
 
-                if qp_img:
+                if _qp_txt:
+                    # ── Text-first rendering ────────────────────────────────
+                    for _txt_line in _qp_txt.split("\n"):
+                        _txt_line = _txt_line.strip()
+                        if not _txt_line:
+                            continue
+                        _is_max = bool(re.match(r"^\[Maximum mark", _txt_line, re.I))
+                        _is_qhd = bool(re.match(rf"^{qn}[.\s]", _txt_line))
+                        _is_sub = bool(re.match(r"^[a-e][.)\s]|^\([a-e]\)", _txt_line))
+                        _tp = doc.add_paragraph()
+                        _tp.paragraph_format.space_before = Pt(4 if _is_max else 0)
+                        _tp.paragraph_format.space_after  = Pt(2)
+                        _tp.paragraph_format.left_indent  = Cm(0.5 if _is_sub else 0)
+                        _s_run(_tp, _txt_line, bold=_is_max or _is_qhd,
+                               size_pt=10 if _is_max else 11)
+                    # If there's also an image (diagrams), include it
+                    if qp_img:
+                        _s_add_img(doc, qp_img)
+                    _qp_pieces_used = 1
+                elif qp_img:
+                    # ── Image rendering ─────────────────────────────────────
                     qp_h = qp_img.height
-                    qp_w = qp_img.width
-
                     if qp_h <= _QP_MAX_H:
-                        # Fits on one page as usual
                         _s_add_img(doc, qp_img)
                         _qp_pieces_used = 1
                     else:
-                        # Split at natural white-space boundaries
                         qp_pieces = _s_split_smart(qp_img, max_h=_QP_SAFE_1ST)
                         for pi_idx, qp_piece in enumerate(qp_pieces):
                             if pi_idx > 0:
-                                # Each extra piece gets its own page
                                 _pb_qp = doc.add_paragraph()
                                 _pb_qp.paragraph_format.page_break_before = True
                                 _pb_qp.paragraph_format.space_before = Pt(0)
@@ -2020,8 +2228,10 @@ def build_structured_worksheet(
                             _s_add_img(doc, qp_piece)
                         _qp_pieces_used = len(qp_pieces)
                 else:
+                    # Neither text nor image available — skip this question
                     p = doc.add_paragraph()
-                    _s_run(p, "[Question image not available]", italic=True, size_pt=11)
+                    _s_run(p, f"⚠ Q{qn} (page {pg}): question content unavailable — skipped",
+                           italic=True, size_pt=10, color="CC0000")
                     _qp_pieces_used = 0
 
                 # ── Student's Solution ────────────────────────────────────
