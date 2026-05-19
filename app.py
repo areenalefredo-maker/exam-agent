@@ -1121,7 +1121,7 @@ _QP_INSTR_PAT = re.compile(
 )
 
 _S_FOOTER_PAT  = re.compile(
-    r"(M\d{2}/\d|N\d{2}/\d|\d{4}EP\d+|©\s*\d{4}|\bTurn over\b|\bPlease do not\b|"
+    r"(M\d{2}/\d|N\d{2}/\d|\d{2,4}EP\d+|©\s*\d{4}|\bTurn over\b|\bPlease do not\b|"
     r"international\s+baccalaureate|\d{4}[\s\-–]+\d{4})", re.I)
 _MS_FT  = re.compile(r"(M\d{2}/\d/|N\d{2}/\d/|©\s*\d{4}|international\s+baccalaureate)", re.I)
 _MS_BN  = re.compile(r"^\s*\d{1,3}\s*$")
@@ -1716,6 +1716,123 @@ def _find_q_in_section_pages(ms_doc, sec, qn):
                     }
     return None
 
+def _detect_session_ms_boundaries(ms_doc: "fitz.Document", 
+                                     session_start_pi: int,
+                                     session_end_pi: int) -> dict[int, tuple[int, int]]:
+    """
+    For Biology-style table-format Mark Schemes, detect where each question's
+    answers start and end within the session's MS pages.
+    
+    Returns: {qn: (start_pi, end_pi)} mapping.
+    """
+    # Biology MS format: rows contain "1. a", "1. b", "2. a" etc.
+    # We detect question start by finding "N. " at start of a table cell
+    qn_pages: dict[int, int] = {}   # qn → first pi where qn appears
+    
+    for pi in range(session_start_pi, min(session_end_pi + 1, len(ms_doc))):
+        page = ms_doc[pi]
+        txt  = page.get_text()
+        # Match "1. a", "2. b" etc. at start of line (table cell boundaries)
+        for m in re.finditer(r"(?:^|\n)(\d{1,2})\.\s+[a-z]", txt):
+            qn = int(m.group(1))
+            if qn not in qn_pages:
+                qn_pages[qn] = pi
+    
+    if not qn_pages:
+        return {}
+    
+    # Build start→end ranges
+    q_order = sorted(qn_pages.keys())
+    boundaries: dict[int, tuple[int, int]] = {}
+    for i, qn in enumerate(q_order):
+        start = qn_pages[qn]
+        if i + 1 < len(q_order):
+            end = qn_pages[q_order[i + 1]] - 1
+            # If same page, end = start
+            if end < start:
+                end = start
+        else:
+            end = session_end_pi
+        boundaries[qn] = (start, end)
+    
+    return boundaries
+
+
+def _crop_ms_biology_range(ms_doc: "fitz.Document",
+                            start_pi: int,
+                            end_pi: int,
+                            scale: float = 150 / 72) -> list:
+    """
+    Crop MS pages start_pi..end_pi for Biology-style table-format Mark Schemes.
+    Returns list of PIL images.
+    Strips headers (– N – YYYYM) and footers (page numbers, © lines).
+    """
+    from PIL import Image
+    import io as _io
+    import fitz as _fitz
+    import numpy as np
+    
+    pieces = []
+    for pi in range(start_pi, min(end_pi + 1, len(ms_doc))):
+        page  = ms_doc[pi]
+        ph    = page.rect.height
+        pw    = page.rect.width
+        
+        ty = ph * 0.03   # default top
+        by = ph * 0.94   # default bottom
+        
+        # Detect and skip page header (– N –, ©, session code lines)
+        td = page.get_text("dict")
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                txt   = "".join(s.get("text", "") for s in spans).strip()
+                bb    = line["bbox"]
+                if bb[1] > ph * 0.18:
+                    break
+                if re.search(r"–\s*\d+\s*–|©\s*International|\d{4}[\-–]\d{4}M?\b", txt):
+                    ty = max(ty, bb[3] + 6)
+        
+        # Detect footer (page numbers, © lines near bottom)
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                spans = line.get("spans", [])
+                txt   = "".join(s.get("text", "") for s in spans).strip()
+                bb    = line["bbox"]
+                if bb[1] < ph * 0.88:
+                    continue
+                if re.search(r"^\d{1,4}$|©|6021M|6009M|6008M|Turn over", txt):
+                    by = min(by, bb[1] - 3)
+        
+        if by <= ty + 20:
+            continue
+        
+        # Render at DPI
+        clip = _fitz.Rect(8, ty, pw - 8, by)
+        pix  = page.get_pixmap(
+            matrix=_fitz.Matrix(scale, scale),
+            clip=clip, alpha=False
+        )
+        img_data = pix.tobytes("png")
+        img = Image.open(_io.BytesIO(img_data)).copy()
+        
+        # Trim trailing whitespace
+        arr = np.array(img)
+        rm  = arr.min(axis=(1, 2))
+        dk  = np.where(rm < 248)[0]
+        if len(dk) > 0:
+            img = img.crop((0, 0, img.width, min(int(dk[-1]) + 12, img.height)))
+        
+        if img.height > 20:
+            pieces.append(img)
+    
+    return pieces
+
+
 def _crop_ms_pieces(ms_doc, q_info):
     spi = q_info["page_idx"]
     epi = q_info.get("end_page_idx", spi)
@@ -2047,14 +2164,23 @@ def build_structured_worksheet(
                 # Extend to [Total:] marker for complete MS
                 _qi = dict(q_info)
                 _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
-                for _ex in range(6):
+                for _ex in range(8):
                     _tpi = _epi0 + _ex
                     if _tpi >= len(ms_doc): break
-                    if re.search(r"\[Total[:\s]", ms_doc[_tpi].get_text(), re.I):
+                    if re.search(r"Total[:\s]", ms_doc[_tpi].get_text(), re.I):
                         _qi["end_page_idx"] = _tpi
-                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.95
+                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.96
                         break
+                # Primary crop (math-style MS)
                 pieces = _crop_ms_pieces(ms_doc, _qi)
+                # Fallback: Biology-style table MS — use range crop
+                if not pieces or sum(p.height for p in pieces) < 80:
+                    pieces = _crop_ms_biology_range(
+                        ms_doc,
+                        _qi["page_idx"],
+                        _qi.get("end_page_idx", _qi["page_idx"]),
+                    )
+                # Validate marks total
                 if pieces:
                     qp_max_mark = r.get("marks", 0) or 0
                     if qp_max_mark > 0:
@@ -2069,7 +2195,8 @@ def build_structured_worksheet(
                         _tm = re.search(r"Total[:\s]+(\d+)\s*marks?", _ms_combo, re.I)
                         if _tm and abs(int(_tm.group(1)) - qp_max_mark) > 2:
                             ms_marks_mismatch = True
-                    ms_imgs = pieces
+                # ← Always set ms_imgs regardless of which path was taken
+                ms_imgs = pieces
 
         # Skip question if no QP content and no MS content
         if not qp_img and not _qp_txt:
