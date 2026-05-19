@@ -1806,9 +1806,31 @@ def build_structured_worksheet(
         d = r.get("difficulty") or "Unspecified"
         grouped.setdefault(t, {}).setdefault(d, []).append(ri)
 
-    sorted_topics = sorted(grouped.keys(), key=_chapter_sort_key)
+    # Skip "Unclassified" / empty topics — don't include poorly classified rows
+    sorted_topics = sorted(
+        (t for t in grouped.keys() if t and t.lower() not in ("unclassified", "unspecified", "")),
+        key=_chapter_sort_key
+    )
+    _skipped_unclassified = sum(
+        len(ris)
+        for t, diffs in grouped.items()
+        if not t or t.lower() in ("unclassified", "unspecified", "")
+        for ris in diffs.values()
+    )
+    if _skipped_unclassified:
+        import streamlit as _st_tmp
+        try:
+            _st_tmp.info(f"ℹ Skipped {_skipped_unclassified} unclassified row(s) — "
+                         "set Topic in Excel to include them.")
+        except Exception:
+            pass
 
-    total_qs = len(xl_rows)
+    # Total questions = only classified rows (unclassified are skipped)
+    _classified_count = sum(
+        1 for r in xl_rows
+        if r.get("_topic_norm") and r["_topic_norm"].lower() not in ("unclassified","unspecified","")
+    )
+    total_qs = _classified_count if _classified_count > 0 else len(xl_rows)
     done_qs  = 0
     first    = True
     ws_q     = 0      # per-chapter counter (resets each new chapter)
@@ -1828,7 +1850,13 @@ def build_structured_worksheet(
                 r    = xl_rows[ri]
                 pg   = r.get("page_num", 0)
                 qn   = r.get("qn", 0)
-                marks = r.get("marks", 1) or 1
+                marks_raw = r.get("marks")
+                marks = int(float(str(marks_raw))) if marks_raw else 0
+                # Skip rows where marks couldn't be determined (likely bad data)
+                if marks <= 0:
+                    done_qs += 1
+                    continue
+                marks = marks or 1
                 quote = r.get("quote", "") or ""
                 if quote in ("nan",):
                     quote = ""
@@ -2036,11 +2064,13 @@ def build_structured_worksheet(
                                f"but MS total may differ. Verify manually.",
                                italic=True, size_pt=9, color="CC6600")
                 else:
+                    # MS is empty — show placeholder but still include the question
+                    # (skipping entirely would cause gaps in question numbering)
                     p = doc.add_paragraph()
                     p.paragraph_format.space_before = Pt(0)
                     p.paragraph_format.space_after  = Pt(2)
-                    _s_run(p, "⚠ Mark Scheme image not available — needs review",
-                           italic=True, size_pt=11)
+                    _s_run(p, "⚠ Mark Scheme not found — please verify manually",
+                           italic=True, size_pt=10, color="CC0000")
 
                 # ── Keep it up (after MS, with HR) ─────────────────────────
                 if quote:
