@@ -1801,6 +1801,66 @@ def _detect_session_ms_boundaries(ms_doc: "fitz.Document",
     return boundaries
 
 
+def _clean_ms_image(img, page, scale: float = 150/72,
+                    clip_left: float = 8.0,
+                    crop_top_y: float = 0.0):
+    """
+    Post-process a cropped MS PIL image:
+    - White-out question number cells ("1. a", "2. b") in the first table column
+    - White-out "(Question N continued)" / "Turn over" / "continued" text
+    Preserves all answer content.
+    """
+    from PIL import ImageDraw as _ID
+    import re as _re
+
+    ph = page.rect.height
+    draw = _ID.Draw(img)
+    iw, ih = img.size
+
+    for block in page.get_text("dict").get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            spans = line.get("spans", [])
+            txt   = "".join(s.get("text", "") for s in spans).strip()
+            bb    = line["bbox"]
+
+            if bb[1] < crop_top_y:
+                continue
+
+            # PDF → image coordinate conversion
+            ix0 = int((bb[0] - clip_left) * scale) - 2
+            ix1 = int((bb[2] - clip_left) * scale) + 2
+            iy0 = int((bb[1] - crop_top_y) * scale) - 2
+            iy1 = int((bb[3] - crop_top_y) * scale) + 2
+            ix0 = max(0, ix0); ix1 = min(iw, ix1)
+            iy0 = max(0, iy0); iy1 = min(ih, iy1)
+            if iy1 <= iy0 or ix1 <= ix0:
+                continue
+
+            # 1. Question number cell: "N. a", "N.", "N. b" at x < 135 in PDF
+            if bb[0] < 135 and _re.match(r"^\d{1,2}\.\s*[a-zA-Z]?$", txt):
+                draw.rectangle([0, iy0, int(135 * scale), iy1], fill="white")
+                continue
+
+            # 2. "(Question N continued)" — full line
+            if _re.search(
+                r"\(?[Qq]uestion\s+\d+\s+continued\)?|"
+                r"^continued\.?$",
+                txt, _re.I
+            ):
+                draw.rectangle([ix0, iy0, ix1, iy1], fill="white")
+                continue
+
+            # 3. "Turn over"
+            if _re.match(r"^Turn over$", txt, _re.I):
+                draw.rectangle([ix0, iy0, ix1, iy1], fill="white")
+                continue
+
+    del draw
+    return img
+
+
 def _crop_ms_biology_range(ms_doc: "fitz.Document",
                             start_pi: int,
                             end_pi: int,
@@ -1871,6 +1931,11 @@ def _crop_ms_biology_range(ms_doc: "fitz.Document",
             img = img.crop((0, 0, img.width, min(int(dk[-1]) + 12, img.height)))
         
         if img.height > 20:
+            # Clean Q numbers and "continued" text from the image
+            img = _clean_ms_image(
+                img, page, scale=scale,
+                clip_left=8.0, crop_top_y=ty
+            )
             pieces.append(img)
     
     return pieces
