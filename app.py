@@ -2078,7 +2078,7 @@ def build_structured_worksheet(
 
         # ── Build Word output ────────────────────────────────────────────────
         ws_q += 1
-        n_sol = _sol_config(qp_img) if qp_img else 7
+        n_sol, sol_separate = _sol_config(qp_img) if qp_img else (7, False)
 
         # Question header (page break before every question except first)
         qh = doc.add_paragraph()
