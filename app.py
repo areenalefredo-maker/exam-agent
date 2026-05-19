@@ -1804,61 +1804,102 @@ def _detect_session_ms_boundaries(ms_doc: "fitz.Document",
 def _clean_ms_image(img, page, scale: float = 150/72,
                     clip_left: float = 8.0,
                     crop_top_y: float = 0.0):
+    """Legacy no-op — cleanup is now done via _crop_ms_page_redacted."""
+    return img
+
+
+def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
     """
-    Post-process a cropped MS PIL image:
-    - White-out question number cells ("1. a", "2. b") in the first table column
-    - White-out "(Question N continued)" / "Turn over" / "continued" text
-    Preserves all answer content.
+    Render a clean MS page by:
+    1. Redacting the Question-number column (x=0..137 in PDF points)
+    2. Redacting headers: Section A/B, Question/Answers/Notes/Total row,
+       page numbers, (Question N continued), Turn over
+    3. Cropping the rendered image to its content bounding box
+    Returns a PIL Image.
     """
-    from PIL import ImageDraw as _ID
+    import fitz as _fitz
+    from PIL import Image as _Image
+    import io as _io
+    import numpy as _np
     import re as _re
 
-    ph = page.rect.height
-    draw = _ID.Draw(img)
-    iw, ih = img.size
+    _Q_COL_RIGHT = 137   # PDF points — right edge of Question column
 
-    for block in page.get_text("dict").get("blocks", []):
-        if block.get("type") != 0:
+    # Work on an in-memory copy so original PDF is not modified
+    _tmp = _fitz.open()
+    _tmp.insert_pdf(ms_doc, from_page=pi, to_page=pi)
+    _pg = _tmp[0]
+    _ph = _pg.rect.height
+    _pw = _pg.rect.width
+
+    _rects = []
+
+    # Always redact the full Question-number column + its border
+    _rects.append(_fitz.Rect(0, 0, _Q_COL_RIGHT, _ph))
+
+    # Scan all text lines for things to redact
+    for _blk in _pg.get_text("dict").get("blocks", []):
+        if _blk.get("type") != 0:
             continue
-        for line in block.get("lines", []):
-            spans = line.get("spans", [])
-            txt   = "".join(s.get("text", "") for s in spans).strip()
-            bb    = line["bbox"]
+        for _ln in _blk.get("lines", []):
+            _spans = _ln.get("spans", [])
+            _txt   = "".join(s.get("text", "") for s in _spans).strip()
+            _bb    = _ln["bbox"]
+            _x0, _y0, _x1, _y1 = _bb
 
-            if bb[1] < crop_top_y:
-                continue
+            # Section A/B header
+            if _re.match(r"^Section\s+[AB]$", _txt, _re.I):
+                _rects.append(_fitz.Rect(0, _y0 - 3, _pw, _y1 + 5))
 
-            # PDF → image coordinate conversion
-            ix0 = int((bb[0] - clip_left) * scale) - 2
-            ix1 = int((bb[2] - clip_left) * scale) + 2
-            iy0 = int((bb[1] - crop_top_y) * scale) - 2
-            iy1 = int((bb[3] - crop_top_y) * scale) + 2
-            ix0 = max(0, ix0); ix1 = min(iw, ix1)
-            iy0 = max(0, iy0); iy1 = min(ih, iy1)
-            if iy1 <= iy0 or ix1 <= ix0:
-                continue
+            # Table header row (Question | Answers | Notes | Total)
+            elif _txt in ("Question", "Answers", "Notes", "Total"):
+                _rects.append(_fitz.Rect(0, _y0 - 3, _pw, _y1 + 5))
 
-            # 1. Question number cell: "N. a", "N.", "N. b" at x < 135 in PDF
-            if bb[0] < 135 and _re.match(r"^\d{1,2}\.\s*[a-zA-Z]?$", txt):
-                draw.rectangle([0, iy0, int(135 * scale), iy1], fill="white")
-                continue
-
-            # 2. "(Question N continued)" — full line
-            if _re.search(
-                r"\(?[Qq]uestion\s+\d+\s+continued\)?|"
-                r"^continued\.?$",
-                txt, _re.I
+            # (Question N continued) / "continued" / "Turn over"
+            elif _re.search(
+                r"[Qq]uestion\s+\d+\s+continued"
+                r"|\(?continued\.?\)?"
+                r"|^Turn\s+over$",
+                _txt, _re.I
             ):
-                draw.rectangle([ix0, iy0, ix1, iy1], fill="white")
-                continue
+                _rects.append(_fitz.Rect(0, _y0 - 2, _pw, _y1 + 3))
 
-            # 3. "Turn over"
-            if _re.match(r"^Turn over$", txt, _re.I):
-                draw.rectangle([ix0, iy0, ix1, iy1], fill="white")
-                continue
+            # Page header/footer: –N– or YYYYM or plain number
+            elif (_y0 < _ph * 0.12 and
+                  _re.search(r"–\s*\d+\s*–|\d{4}[\-–]\d{4}M?|©", _txt)):
+                _rects.append(_fitz.Rect(0, _y0 - 2, _pw, _y1 + 3))
+            elif _y0 > _ph * 0.90 and _re.match(r"^\d{1,4}$", _txt):
+                _rects.append(_fitz.Rect(0, _y0 - 2, _pw, _y1 + 3))
 
-    del draw
-    return img
+    for _r in _rects:
+        try:
+            _pg.add_redact_annot(_r, fill=(1, 1, 1))
+        except Exception:
+            pass
+    try:
+        _pg.apply_redactions()
+    except Exception:
+        pass
+
+    # Render
+    _pix = _pg.get_pixmap(matrix=_fitz.Matrix(scale, scale), alpha=False)
+    _img = _Image.open(_io.BytesIO(_pix.tobytes("png"))).copy()
+    _tmp.close()
+
+    # Auto-trim to content bounding box
+    _arr = _np.array(_img)
+    _rm  = _arr.min(axis=(1, 2))   # row darkness
+    _cm  = _arr.min(axis=(0, 2))   # col darkness
+    _dr  = _np.where(_rm < 248)[0]
+    _dc  = _np.where(_cm < 248)[0]
+    if len(_dr) and len(_dc):
+        top   = max(0,           int(_dr[0])  - 8)
+        bot   = min(_img.height, int(_dr[-1]) + 15)
+        left  = max(0,           int(_dc[0])  - 8)
+        right = min(_img.width,  int(_dc[-1]) + 15)
+        _img  = _img.crop((left, top, right, bot))
+
+    return _img
 
 
 def _crop_ms_biology_range(ms_doc: "fitz.Document",
@@ -1867,80 +1908,17 @@ def _crop_ms_biology_range(ms_doc: "fitz.Document",
                             scale: float = 150 / 72) -> list:
     """
     Crop MS pages start_pi..end_pi for Biology-style table-format Mark Schemes.
-    Returns list of PIL images.
-    Strips headers (– N – YYYYM) and footers (page numbers, © lines).
+    Uses _crop_ms_page_redacted to remove Q-number column, headers, and
+    "continued" labels cleanly.
+    Returns list of PIL Images.
     """
-    from PIL import Image
-    import io as _io
-    import fitz as _fitz
-    import numpy as np
-    
+    from PIL import Image as _Img
     pieces = []
     for pi in range(start_pi, min(end_pi + 1, len(ms_doc))):
-        page  = ms_doc[pi]
-        ph    = page.rect.height
-        pw    = page.rect.width
-        
-        ty = ph * 0.03   # default top
-        by = ph * 0.94   # default bottom
-        
-        # Detect and skip page header (– N –, ©, session code lines)
-        td = page.get_text("dict")
-        for block in td.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                spans = line.get("spans", [])
-                txt   = "".join(s.get("text", "") for s in spans).strip()
-                bb    = line["bbox"]
-                if bb[1] > ph * 0.18:
-                    break
-                if re.search(r"–\s*\d+\s*–|©\s*International|\d{4}[\-–]\d{4}M?\b", txt):
-                    ty = max(ty, bb[3] + 6)
-        
-        # Detect footer (page numbers, © lines near bottom)
-        for block in td.get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                spans = line.get("spans", [])
-                txt   = "".join(s.get("text", "") for s in spans).strip()
-                bb    = line["bbox"]
-                if bb[1] < ph * 0.88:
-                    continue
-                if re.search(r"^\d{1,4}$|©|6021M|6009M|6008M|Turn over", txt):
-                    by = min(by, bb[1] - 3)
-        
-        if by <= ty + 20:
-            continue
-        
-        # Render at DPI
-        clip = _fitz.Rect(8, ty, pw - 8, by)
-        pix  = page.get_pixmap(
-            matrix=_fitz.Matrix(scale, scale),
-            clip=clip, alpha=False
-        )
-        img_data = pix.tobytes("png")
-        img = Image.open(_io.BytesIO(img_data)).copy()
-        
-        # Trim trailing whitespace
-        arr = np.array(img)
-        rm  = arr.min(axis=(1, 2))
-        dk  = np.where(rm < 248)[0]
-        if len(dk) > 0:
-            img = img.crop((0, 0, img.width, min(int(dk[-1]) + 12, img.height)))
-        
+        img = _crop_ms_page_redacted(ms_doc, pi, scale=scale)
         if img.height > 20:
-            # Clean Q numbers and "continued" text from the image
-            img = _clean_ms_image(
-                img, page, scale=scale,
-                clip_left=8.0, crop_top_y=ty
-            )
             pieces.append(img)
-    
     return pieces
-
-
 def _crop_ms_pieces(ms_doc, q_info):
     spi = q_info["page_idx"]
     epi = q_info.get("end_page_idx", spi)
