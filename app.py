@@ -2649,9 +2649,12 @@ if st.button(
                         f"({n_segs} Excel segments → {n_ms} MS sections, "
                         f"ratio={n_ms/max(n_segs,1):.2f})")
 
-        # Dummy variables kept for compatibility with the match table display below
-        seg_max_qns          = [0] * n_segs
-        overall_excel_max_qn = 5
+        # Compute actual segment max question numbers for display
+        seg_max_qns = []
+        for _sg in segments:
+            _qns = [xl_rows[_ri].get("qn", 0) or 0 for _ri in _sg]
+            seg_max_qns.append(max(_qns) if _qns else 0)
+        overall_excel_max_qn = max(seg_max_qns) if seg_max_qns else 5
         def _ms_max_qn(s):
             return s.get("max_qn", len(s.get("questions", {}))) if isinstance(s, dict) else 0
         try:
@@ -2675,7 +2678,7 @@ if st.button(
                 ref_str  = xl_rows[seg_rows[0]].get("ref", "") if seg_rows else ""
                 seg_mq   = seg_max_qns[seg_idx]
                 ms_mq    = _ms_max_qn(ms_sec) if ms_sec else 0
-                ok       = ms_mq == 0 or abs(ms_mq - seg_mq) <= 3
+                ok       = seg_mq == 0 or ms_mq == 0 or abs(ms_mq - seg_mq) <= 3
                 match_table.append({
                     "Seg#":        seg_idx + 1,
                     "Excel Ref":   ref_str[:40],
@@ -2755,8 +2758,11 @@ if st.button(
                 sec_idx = row_to_section_idx.get(i, -1)
                 qn      = r2["qn"]
                 q_info  = (sec.get("questions", {}).get(qn) if sec and "questions" in sec else None)
-                if q_info is None and sec and isinstance(sec, dict):
-                    q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+                # In preview mode, ms_doc is not open; use section-level fallback only
+                if q_info is None and sec and isinstance(sec, dict) and sec.get("questions"):
+                    # Accept any section with questions as a valid MS match
+                    qs_any = sec["questions"]
+                    q_info = qs_any.get(qn) or next(iter(qs_any.values()), None)
                 # Fallback: use entire section if specific Q not found
                 if q_info is None and sec and isinstance(sec, dict) and sec.get("questions"):
                     qs_s = sorted(sec["questions"].keys())
