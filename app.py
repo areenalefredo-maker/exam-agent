@@ -2626,11 +2626,22 @@ def build_structured_worksheet(
                 # ── Biology-boundary crop ────────────────────────────────────
                 # Use find_biology_ms_q_boundaries to get exact per-question
                 # page ranges: continues until the NEXT question starts.
-                # ── Biology-boundary crop ──────────────────────────────────
+                # ── Biology-boundary crop — session-scoped ─────────────────
+                # Use EXACT session boundaries from ms_sections to avoid
+                # crossing into adjacent sessions
                 _bio_start = q_info["page_idx"]
                 _bio_end   = q_info.get("end_page_idx", _bio_start)
-                _sess_start = max(0, _bio_start - 5)
-                _sess_end   = min(len(ms_doc) - 1, _bio_end + 25)
+                # Session boundaries: start_page of this section, end_page of this section
+                _sess_start = (sec.get("start_page", 1) - 1) if sec else max(0, _bio_start - 5)
+                _sess_last_q = sorted(sec.get("questions", {}).keys()) if sec else []
+                if _sess_last_q and sec:
+                    _last_q_info = sec["questions"][_sess_last_q[-1]]
+                    _sess_end = _last_q_info.get("end_page_idx", _bio_end) + 3
+                else:
+                    _sess_end = min(len(ms_doc) - 1, _bio_end + 25)
+                # Clamp to doc bounds
+                _sess_start = max(0, _sess_start)
+                _sess_end   = min(len(ms_doc) - 1, _sess_end)
                 _bio_bounds = find_biology_ms_q_boundaries(
                     ms_doc, _sess_start, _sess_end
                 )
@@ -2639,21 +2650,25 @@ def build_structured_worksheet(
                     q_info = dict(q_info)
                     q_info["page_idx"]     = _bs
                     q_info["end_page_idx"] = _be
-                    q_info["top_y"]        = ms_doc[_bs].rect.height * 0.03
-                    q_info["end_y"]        = ms_doc[_be].rect.height * 0.97
+                    q_info["top_y"]        = ms_doc[_bs].rect.height * 0.02
+                    q_info["end_y"]        = ms_doc[_be].rect.height * 0.98
 
-                _qi   = dict(q_info)
-                _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
-                for _ex in range(8):
+                _qi      = dict(q_info)
+                _epi0    = _qi.get("end_page_idx", _qi["page_idx"])
+                # Extend to Total marker but stay within session
+                _max_extend = min(_sess_end, _epi0 + 8)
+                for _ex in range(_max_extend - _epi0 + 1):
                     _tpi = _epi0 + _ex
-                    if _tpi >= len(ms_doc): break
+                    if _tpi > _max_extend or _tpi >= len(ms_doc): break
                     _t2 = ms_doc[_tpi].get_text()
-                    if re.search(rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]",
-                                 _t2, re.MULTILINE):
+                    # Stop if next question starts (stay in same question)
+                    if _ex > 0 and re.search(
+                        rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]", _t2, re.MULTILINE
+                    ):
                         break
                     if re.search(r"Total[:\s]", _t2, re.I):
                         _qi["end_page_idx"] = _tpi
-                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.97
+                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.98
                         break
 
                 pieces = _crop_ms_biology_range(
