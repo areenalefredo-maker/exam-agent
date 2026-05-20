@@ -1928,14 +1928,180 @@ def _extract_ms_text(ms_doc, start_pi: int, end_pi: int,
 
 
 
+def _crop_ms_by_subparts(ms_doc, start_pi: int, end_pi: int,
+                          scale: float = 150 / 72) -> list:
+    """
+    Crop MS into per-sub-part images (a, b, c... separately).
+    Excludes Notes column. Removes Q-number prefix ("N."), keeps sub-part letter.
+    """
+    import re as _re
+
+    ANS_LEFT  = 125   # includes Q-column sub-part letters
+    ANS_RIGHT = 548   # excludes Notes column
+
+    def _hdr_bottom(page):
+        """Y of bottom of table header row (Answers/Notes/Total row)."""
+        ph2 = page.rect.height
+        for blk in page.get_text("rawdict").get("blocks", []):
+            if blk.get("type") != 0: continue
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    bb2  = sp.get("bbox", [0,0,0,0])
+                    cs2  = "".join(c.get("c","") for c in sp.get("chars",[])).strip()
+                    if cs2 == "Answers" and bb2[1] < ph2 * 0.40:
+                        return bb2[3] + 4
+        return ph2 * 0.08
+
+    # Collect ALL sub-part markers (no y filter on header)
+    all_parts = []
+    for pi in range(start_pi, min(end_pi + 1, len(ms_doc))):
+        page = ms_doc[pi]; ph = page.rect.height
+        for blk in page.get_text("rawdict").get("blocks", []):
+            if blk.get("type") != 0: continue
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    bb   = sp.get("bbox", [0,0,0,0])
+                    x0, y0 = bb[0], bb[1]
+                    chars = sp.get("chars", [])
+                    # Q-column only, within content area
+                    if x0 >= 135 or y0 < 60 or y0 > ph * 0.93 or not chars:
+                        continue
+                    cs = "".join(c.get("c","") for c in chars).strip()
+                    m  = _re.match(r"^\d{1,2}\.\s*([a-z])\s*$", cs)
+                    if m:
+                        all_parts.append({
+                            "part": m.group(1), "pi": pi, "y_start": y0
+                        })
+
+    if not all_parts:
+        return []
+
+    all_parts.sort(key=lambda x: (x["pi"], x["y_start"]))
+    results = []
+
+    for idx, part_info in enumerate(all_parts):
+        pi      = part_info["pi"]
+        page    = ms_doc[pi]; ph = page.rect.height
+        hdr_bot = _hdr_bottom(page)
+
+        # Crop start: just above the sub-part label, but never inside header row
+        y_raw   = part_info["y_start"] - 5
+        y_start = max(hdr_bot, y_raw)
+
+        # Crop end: start of next part on same page, or page bottom
+        if idx + 1 < len(all_parts):
+            np2   = all_parts[idx + 1]
+            y_end = (np2["y_start"] - 4 if np2["pi"] == pi else ph * 0.92)
+        else:
+            y_end = ph * 0.92
+
+        # Extend to last content line in range
+        last_y = y_end
+        for blk in page.get_text("rawdict").get("blocks", []):
+            if blk.get("type") != 0: continue
+            for ln in blk.get("lines", []):
+                for sp in ln.get("spans", []):
+                    bb2 = sp.get("bbox", [0,0,0,0])
+                    x2, y2 = bb2[0], bb2[1]
+                    if (y2 >= y_start - 2 and bb2[3] <= y_end + 6
+                            and ANS_LEFT <= x2 < ANS_RIGHT):
+                        last_y = max(last_y, bb2[3] + 8)
+        y_end_actual = min(last_y, y_end + 4)
+
+        # Render page with digit-only redaction
+        from PIL import Image as _Img
+        import fitz as _fitz
+        import io as _io
+        import numpy as _np
+
+        tmp = _fitz.open()
+        tmp.insert_pdf(ms_doc, from_page=pi, to_page=pi)
+        pg2 = tmp[0]
+        rects2 = []
+
+        for blk in pg2.get_text("rawdict").get("blocks", []):
+            if blk.get("type") != 0: continue
+            for ln in blk.get("lines", []):
+                lbb = ln["bbox"]; lx0, ly0, lx1, ly1 = lbb
+                chars_all = [c for sp in ln.get("spans",[]) for c in sp.get("chars",[])]
+                ln_txt = "".join(c.get("c","") for c in chars_all).strip()
+
+                # Redact "N." digits in Q column
+                for sp in ln.get("spans", []):
+                    bb3 = sp.get("bbox", [0,0,0,0])
+                    sx0, sy0, sx1, sy1 = bb3
+                    chars3 = sp.get("chars", [])
+                    if sx0 >= 135 or not chars3: continue
+                    cs3 = "".join(c.get("c","") for c in chars3).strip()
+                    if _re.match(r"^\d{1,2}\.?\s*[a-z]?\s*$", cs3):
+                        letter_x = None; digit_end_x = None
+                        for ch in chars3:
+                            cc = ch.get("c",""); cbb = ch.get("bbox",[0,0,0,0])
+                            if cc.isalpha() and cbb[0] > 92 and letter_x is None:
+                                letter_x = cbb[0] - 2
+                            if cc.isdigit():
+                                digit_end_x = cbb[2] + 2
+                        if digit_end_x:
+                            rr = letter_x if letter_x else digit_end_x + 6
+                            rects2.append(_fitz.Rect(0, sy0-2, rr, sy1+2))
+
+                # Redact page artifacts
+                if (ly0 < ph * 0.10 and
+                        _re.search(r"–\s*\d+\s*–|\d{4}[\-–]\d{4}M?|©", ln_txt)):
+                    rects2.append(_fitz.Rect(0, ly0-2, pw2, ly1+3))
+                elif _re.search(r"\(?[Qq]uestion\s+\d+\s+continued\)?", ln_txt, _re.I):
+                    rects2.append(_fitz.Rect(0, ly0-2, pw2, ly1+3))
+                elif _re.match(r"^Turn\s+over$", ln_txt, _re.I):
+                    rects2.append(_fitz.Rect(0, ly0-2, pw2, ly1+3))
+
+        # Also redact Section A header and Answers/Notes/Total row
+        for blk in pg2.get_text("rawdict").get("blocks", []):
+            if blk.get("type") != 0: continue
+            for ln in blk.get("lines", []):
+                lbb2 = ln["bbox"]; ly0b = lbb2[1]; ly1b = lbb2[3]
+                ln_t2 = "".join(c.get("c","")
+                                for sp in ln.get("spans",[])
+                                for c in sp.get("chars",[])).strip()
+                if _re.match(r"^Section\s+[AB]$", ln_t2, _re.I):
+                    rects2.append(_fitz.Rect(0, ly0b-3, pw2, ly1b+4))
+                elif ln_t2 in ("Answers", "Notes", "Total", "Question"):
+                    rects2.append(_fitz.Rect(0, ly0b-3, pw2, ly1b+4))
+
+        pw2 = pg2.rect.width
+        for rect in rects2:
+            try: pg2.add_redact_annot(rect, fill=(1,1,1))
+            except: pass
+        try: pg2.apply_redactions()
+        except: pass
+
+        # Crop and render
+        clip = _fitz.Rect(ANS_LEFT, y_start, ANS_RIGHT, y_end_actual)
+        pix  = pg2.get_pixmap(matrix=_fitz.Matrix(scale, scale), clip=clip, alpha=False)
+        img  = _Img.open(_io.BytesIO(pix.tobytes("png"))).copy()
+        tmp.close()
+
+        # Trim whitespace top and bottom
+        arr = _np.array(img); rm = arr.min(axis=(1, 2))
+        dk  = _np.where(rm < 248)[0]
+        if len(dk) > 0:
+            top3 = max(0,          int(dk[0])  - 4)
+            bot3 = min(img.height, int(dk[-1]) + 10)
+            img  = img.crop((0, top3, img.width, bot3))
+
+        if img.height > 10:
+            results.append({"part": part_info["part"], "img": img})
+
+    return results
+
+
+
 def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
     """
-    Render a clean MS page:
-    - Removes "Question" column header
-    - Removes "N." prefix from "N. a" entries, keeps sub-part letter visible
-    - Removes page headers/footers, "Section A", "(Question N continued)", "Turn over"
-    - Keeps: Answers / Notes / Total headers, marks (1 / 2 max / 3 max), all answer content
-    Uses rawdict chars[] for precise character-level redaction.
+    Render a clean MS page image:
+    - Removes ONLY the question NUMBER (e.g. "1.", "2.") from the Q column
+    - Keeps: "Question" header, sub-part letters (a,b,c,d), all answer/notes/total content
+    - Removes: page header/footer, "(Question N continued)", "Turn over"
+    Uses rawdict chars[] for precise redaction of digits only.
     """
     import fitz as _fitz
     from PIL import Image as _Image
@@ -1950,7 +2116,7 @@ def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
     pw  = pg.rect.width
     rects = []
 
-    # ── Pass 1: use rawdict for character-level Q-column redaction ────────
+    # ── Pass 1: rawdict chars — redact only "N." digits in Q column ──────
     for blk in pg.get_text("rawdict").get("blocks", []):
         if blk.get("type") != 0:
             continue
@@ -1960,40 +2126,41 @@ def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
                 x0, y0, x1, y1 = bb
                 chars = sp.get("chars", [])
 
-                # Only process Q-column entries in content area
+                # Only Q-column, content area
                 if x0 >= 135 or y0 < ph * 0.10 or y0 > ph * 0.92:
                     continue
                 if not chars:
                     continue
 
-                char_texts = [c.get("c", "") for c in chars]
-                char_str   = "".join(char_texts).strip()
+                char_str = "".join(c.get("c", "") for c in chars).strip()
 
-                # "Question" header → redact entire span
-                if char_str in ("Question", "question"):
-                    rects.append(_fitz.Rect(x0 - 2, y0 - 2, x1 + 2, y1 + 2))
-                    continue
-
-                # "N. a" pattern → find first alpha char at x > 92, redact before it
+                # Pattern "N. a" or "N. b" — redact ONLY the leading "N." digits
+                # Keep the sub-part letter (a/b/c/d) and everything after
                 if _re.match(r"^\d{1,2}\.?\s*[a-z]?\s*$", char_str):
+                    # Find where the sub-part letter starts (first alpha at x > 92)
                     letter_x = None
                     for ch in chars:
                         c_char = ch.get("c", "")
                         c_bb   = ch.get("bbox", [0, 0, 0, 0])
-                        # Sub-part letter is alphabetic and to the right of "N. "
                         if c_char.isalpha() and c_bb[0] > 92:
-                            letter_x = c_bb[0] - 2   # 2px margin before letter
+                            letter_x = c_bb[0] - 2
                             break
 
-                    if letter_x:
-                        # Redact from left edge up to (but not including) the letter
-                        rects.append(_fitz.Rect(0, y0 - 2, letter_x, y1 + 2))
-                    else:
-                        # No letter found → redact entire span (pure number like "1.")
-                        rects.append(_fitz.Rect(0, y0 - 2, x1 + 2, y1 + 2))
-                    continue
+                    # Find where the digit ends (last digit char bbox right edge)
+                    digit_end_x = None
+                    for ch in chars:
+                        c_char = ch.get("c", "")
+                        c_bb   = ch.get("bbox", [0, 0, 0, 0])
+                        if c_char.isdigit():
+                            digit_end_x = c_bb[2] + 2  # right edge of digit
 
-    # ── Pass 2: use dict for line-level text redactions ───────────────────
+                    if digit_end_x:
+                        # Redact only the digit and dot: x=0 to digit_end_x
+                        # or up to (but not including) the sub-part letter
+                        redact_right = letter_x if letter_x else digit_end_x + 6
+                        rects.append(_fitz.Rect(0, y0 - 2, redact_right, y1 + 2))
+
+    # ── Pass 2: line-level — remove page headers/footers and continued ────
     for blk in pg.get_text("dict").get("blocks", []):
         if blk.get("type") != 0:
             continue
@@ -2009,17 +2176,12 @@ def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
                 rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
                 continue
 
-            # Page footer (bare page number)
+            # Page footer (bare page number near bottom)
             if ly0 > ph * 0.90 and _re.match(r"^\d{1,4}$", txt):
                 rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
                 continue
 
-            # "Section A" / "Section B" page-level label
-            if _re.match(r"^Section\s+[AB]$", txt, _re.I) and ly0 < ph * 0.20:
-                rects.append(_fitz.Rect(0, ly0 - 3, pw, ly1 + 4))
-                continue
-
-            # "(Question N continued)"
+            # "(Question N continued)" — remove the continuation label
             if _re.search(r"\(?[Qq]uestion\s+\d+\s+continued\)?", txt, _re.I):
                 rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
                 continue
@@ -2029,7 +2191,7 @@ def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
                 rects.append(_fitz.Rect(0, ly0 - 2, pw, ly1 + 3))
                 continue
 
-    # ── Apply redactions ──────────────────────────────────────────────────
+    # ── Apply & render ────────────────────────────────────────────────────
     for rect in rects:
         try:
             pg.add_redact_annot(rect, fill=(1, 1, 1))
@@ -2040,7 +2202,6 @@ def _crop_ms_page_redacted(ms_doc, pi: int, scale: float = 150 / 72) -> "Image":
     except Exception:
         pass
 
-    # ── Render ────────────────────────────────────────────────────────────
     pix = pg.get_pixmap(matrix=_fitz.Matrix(scale, scale), alpha=False)
     img = _Image.open(_io.BytesIO(pix.tobytes("png"))).copy()
     tmp.close()
@@ -2407,70 +2568,74 @@ def build_structured_worksheet(
                     "marker_right_x": 0,
                 }
             if q_info:
+                # ── Try per-sub-part crop first (no Notes, clean) ────────────
+                _sp_start = q_info.get("page_idx", 0)
+                _sp_end   = q_info.get("end_page_idx", _sp_start)
+                _subpart_crops = _crop_ms_by_subparts(ms_doc, _sp_start, _sp_end)
+                if _subpart_crops:
+                    ms_imgs = [sp["img"] for sp in _subpart_crops if sp["img"].height > 10]
+                    if ms_imgs:
+                        # Skip the rest of the matching logic — we have clean subpart images
+                        pass
+
                 # ── Biology-boundary crop (highest priority) ─────────────────
                 # Use find_biology_ms_q_boundaries to get exact per-question
                 # page ranges: continues until the NEXT question starts.
-                _bio_start = q_info["page_idx"]
-                _bio_end   = q_info.get("end_page_idx", _bio_start)
-                # Search session boundaries: look ±20 pages around q_info
-                _sess_start = max(0, _bio_start - 5)
-                _sess_end   = min(len(ms_doc) - 1, _bio_end + 25)
-                _bio_bounds = find_biology_ms_q_boundaries(
-                    ms_doc, _sess_start, _sess_end
-                )
-                if qn in _bio_bounds:
-                    _bs, _be = _bio_bounds[qn]
-                    q_info = dict(q_info)
-                    q_info["page_idx"]     = _bs
-                    q_info["end_page_idx"] = _be
-                    q_info["top_y"]        = ms_doc[_bs].rect.height * 0.03
-                    q_info["end_y"]        = ms_doc[_be].rect.height * 0.97
+                if not ms_imgs:
+                    # ── Biology-boundary crop fallback ────────────────────────
+                    _bio_start = q_info["page_idx"]
+                    _bio_end   = q_info.get("end_page_idx", _bio_start)
+                    _sess_start = max(0, _bio_start - 5)
+                    _sess_end   = min(len(ms_doc) - 1, _bio_end + 25)
+                    _bio_bounds = find_biology_ms_q_boundaries(
+                        ms_doc, _sess_start, _sess_end
+                    )
+                    if qn in _bio_bounds:
+                        _bs, _be = _bio_bounds[qn]
+                        q_info = dict(q_info)
+                        q_info["page_idx"]     = _bs
+                        q_info["end_page_idx"] = _be
+                        q_info["top_y"]        = ms_doc[_bs].rect.height * 0.03
+                        q_info["end_y"]        = ms_doc[_be].rect.height * 0.97
 
-                # Extend to [Total:] marker (extra safety for math-style MS)
-                _qi   = dict(q_info)
-                _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
-                for _ex in range(8):
-                    _tpi = _epi0 + _ex
-                    if _tpi >= len(ms_doc): break
-                    _t2 = ms_doc[_tpi].get_text()
-                    # Stop extending if next question starts
-                    if re.search(rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]",
-                                 _t2, re.MULTILINE):
-                        break
-                    if re.search(r"Total[:\s]", _t2, re.I):
-                        _qi["end_page_idx"] = _tpi
-                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.97
-                        break
+                    _qi   = dict(q_info)
+                    _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
+                    for _ex in range(8):
+                        _tpi = _epi0 + _ex
+                        if _tpi >= len(ms_doc): break
+                        _t2 = ms_doc[_tpi].get_text()
+                        if re.search(rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]",
+                                     _t2, re.MULTILINE):
+                            break
+                        if re.search(r"Total[:\s]", _t2, re.I):
+                            _qi["end_page_idx"] = _tpi
+                            _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.97
+                            break
 
-                # Primary crop (biology range → most reliable)
-                pieces = _crop_ms_biology_range(
-                    ms_doc,
-                    _qi["page_idx"],
-                    _qi.get("end_page_idx", _qi["page_idx"]),
-                )
-                # Fallback: math-style crop if biology range fails
-                if not pieces or sum(p.height for p in pieces) < 80:
-                    pieces = _crop_ms_pieces(ms_doc, _qi)
+                    pieces = _crop_ms_biology_range(
+                        ms_doc, _qi["page_idx"],
+                        _qi.get("end_page_idx", _qi["page_idx"]),
+                    )
+                    if not pieces or sum(p.height for p in pieces) < 80:
+                        pieces = _crop_ms_pieces(ms_doc, _qi)
 
-                # Validate marks total
-                if pieces:
-                    qp_max_mark = r.get("marks", 0) or 0
-                    if qp_max_mark > 0:
-                        _ms_combo = ""
-                        try:
-                            for _pi2 in range(_qi["page_idx"],
-                                              min(_qi.get("end_page_idx",
-                                                          _qi["page_idx"]) + 1,
-                                                  len(ms_doc))):
-                                _ms_combo += ms_doc[_pi2].get_text()
-                        except Exception:
-                            pass
-                        _tm = re.search(r"Total[:\s]+(\d+)\s*marks?",
-                                        _ms_combo, re.I)
-                        if _tm and abs(int(_tm.group(1)) - qp_max_mark) > 2:
-                            ms_marks_mismatch = True
-                # ← Always set ms_imgs regardless of path
-                ms_imgs = pieces
+                    if pieces:
+                        qp_max_mark = r.get("marks", 0) or 0
+                        if qp_max_mark > 0:
+                            _ms_combo = ""
+                            try:
+                                for _pi2 in range(_qi["page_idx"],
+                                                  min(_qi.get("end_page_idx",
+                                                              _qi["page_idx"]) + 1,
+                                                      len(ms_doc))):
+                                    _ms_combo += ms_doc[_pi2].get_text()
+                            except Exception:
+                                pass
+                            _tm = re.search(r"Total[:\s]+(\d+)\s*marks?",
+                                            _ms_combo, re.I)
+                            if _tm and abs(int(_tm.group(1)) - qp_max_mark) > 2:
+                                ms_marks_mismatch = True
+                    ms_imgs = pieces
 
         # Skip question if no QP content and no MS content
         if not qp_img and not _qp_txt:
