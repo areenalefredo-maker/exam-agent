@@ -2017,6 +2017,7 @@ def _crop_ms_by_subparts(ms_doc, start_pi: int, end_pi: int,
         tmp = _fitz.open()
         tmp.insert_pdf(ms_doc, from_page=pi, to_page=pi)
         pg2 = tmp[0]
+        pw2 = pg2.rect.width   # define pw2 immediately after pg2
         rects2 = []
 
         for blk in pg2.get_text("rawdict").get("blocks", []):
@@ -2067,7 +2068,6 @@ def _crop_ms_by_subparts(ms_doc, start_pi: int, end_pi: int,
                 elif ln_t2 in ("Answers", "Notes", "Total", "Question"):
                     rects2.append(_fitz.Rect(0, ly0b-3, pw2, ly1b+4))
 
-        pw2 = pg2.rect.width
         for rect in rects2:
             try: pg2.add_redact_annot(rect, fill=(1,1,1))
             except: pass
