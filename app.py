@@ -2568,74 +2568,63 @@ def build_structured_worksheet(
                     "marker_right_x": 0,
                 }
             if q_info:
-                # ── Try per-sub-part crop first (no Notes, clean) ────────────
-                _sp_start = q_info.get("page_idx", 0)
-                _sp_end   = q_info.get("end_page_idx", _sp_start)
-                _subpart_crops = _crop_ms_by_subparts(ms_doc, _sp_start, _sp_end)
-                if _subpart_crops:
-                    ms_imgs = [sp["img"] for sp in _subpart_crops if sp["img"].height > 10]
-                    if ms_imgs:
-                        # Skip the rest of the matching logic — we have clean subpart images
-                        pass
-
-                # ── Biology-boundary crop (highest priority) ─────────────────
+                # ── Biology-boundary crop ────────────────────────────────────
                 # Use find_biology_ms_q_boundaries to get exact per-question
                 # page ranges: continues until the NEXT question starts.
-                if not ms_imgs:
-                    # ── Biology-boundary crop fallback ────────────────────────
-                    _bio_start = q_info["page_idx"]
-                    _bio_end   = q_info.get("end_page_idx", _bio_start)
-                    _sess_start = max(0, _bio_start - 5)
-                    _sess_end   = min(len(ms_doc) - 1, _bio_end + 25)
-                    _bio_bounds = find_biology_ms_q_boundaries(
-                        ms_doc, _sess_start, _sess_end
-                    )
-                    if qn in _bio_bounds:
-                        _bs, _be = _bio_bounds[qn]
-                        q_info = dict(q_info)
-                        q_info["page_idx"]     = _bs
-                        q_info["end_page_idx"] = _be
-                        q_info["top_y"]        = ms_doc[_bs].rect.height * 0.03
-                        q_info["end_y"]        = ms_doc[_be].rect.height * 0.97
+                # ── Biology-boundary crop ──────────────────────────────────
+                _bio_start = q_info["page_idx"]
+                _bio_end   = q_info.get("end_page_idx", _bio_start)
+                _sess_start = max(0, _bio_start - 5)
+                _sess_end   = min(len(ms_doc) - 1, _bio_end + 25)
+                _bio_bounds = find_biology_ms_q_boundaries(
+                    ms_doc, _sess_start, _sess_end
+                )
+                if qn in _bio_bounds:
+                    _bs, _be = _bio_bounds[qn]
+                    q_info = dict(q_info)
+                    q_info["page_idx"]     = _bs
+                    q_info["end_page_idx"] = _be
+                    q_info["top_y"]        = ms_doc[_bs].rect.height * 0.03
+                    q_info["end_y"]        = ms_doc[_be].rect.height * 0.97
 
-                    _qi   = dict(q_info)
-                    _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
-                    for _ex in range(8):
-                        _tpi = _epi0 + _ex
-                        if _tpi >= len(ms_doc): break
-                        _t2 = ms_doc[_tpi].get_text()
-                        if re.search(rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]",
-                                     _t2, re.MULTILINE):
-                            break
-                        if re.search(r"Total[:\s]", _t2, re.I):
-                            _qi["end_page_idx"] = _tpi
-                            _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.97
-                            break
+                _qi   = dict(q_info)
+                _epi0 = _qi.get("end_page_idx", _qi["page_idx"])
+                for _ex in range(8):
+                    _tpi = _epi0 + _ex
+                    if _tpi >= len(ms_doc): break
+                    _t2 = ms_doc[_tpi].get_text()
+                    if re.search(rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]",
+                                 _t2, re.MULTILINE):
+                        break
+                    if re.search(r"Total[:\s]", _t2, re.I):
+                        _qi["end_page_idx"] = _tpi
+                        _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.97
+                        break
 
-                    pieces = _crop_ms_biology_range(
-                        ms_doc, _qi["page_idx"],
-                        _qi.get("end_page_idx", _qi["page_idx"]),
-                    )
-                    if not pieces or sum(p.height for p in pieces) < 80:
-                        pieces = _crop_ms_pieces(ms_doc, _qi)
+                pieces = _crop_ms_biology_range(
+                    ms_doc, _qi["page_idx"],
+                    _qi.get("end_page_idx", _qi["page_idx"]),
+                )
+                if not pieces or sum(p.height for p in pieces) < 80:
+                    pieces = _crop_ms_pieces(ms_doc, _qi)
 
-                    if pieces:
-                        qp_max_mark = r.get("marks", 0) or 0
-                        if qp_max_mark > 0:
-                            _ms_combo = ""
-                            try:
-                                for _pi2 in range(_qi["page_idx"],
-                                                  min(_qi.get("end_page_idx",
-                                                              _qi["page_idx"]) + 1,
-                                                      len(ms_doc))):
-                                    _ms_combo += ms_doc[_pi2].get_text()
-                            except Exception:
-                                pass
-                            _tm = re.search(r"Total[:\s]+(\d+)\s*marks?",
-                                            _ms_combo, re.I)
-                            if _tm and abs(int(_tm.group(1)) - qp_max_mark) > 2:
-                                ms_marks_mismatch = True
-                    ms_imgs = pieces
+                if pieces:
+                    qp_max_mark = r.get("marks", 0) or 0
+                    if qp_max_mark > 0:
+                        _ms_combo = ""
+                        try:
+                            for _pi2 in range(_qi["page_idx"],
+                                              min(_qi.get("end_page_idx",
+                                                          _qi["page_idx"]) + 1,
+                                                  len(ms_doc))):
+                                _ms_combo += ms_doc[_pi2].get_text()
+                        except Exception:
+                            pass
+                        _tm = re.search(r"Total[:\s]+(\d+)\s*marks?",
+                                        _ms_combo, re.I)
+                        if _tm and abs(int(_tm.group(1)) - qp_max_mark) > 2:
+                            ms_marks_mismatch = True
+                ms_imgs = pieces
 
         # Skip question if no QP content and no MS content
         if not qp_img and not _qp_txt:
