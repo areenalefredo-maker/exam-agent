@@ -1418,7 +1418,10 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
             fw = y0
             break
 
-    se = cont_y or fw or nq
+    # Use cont_y if present; fw (first writing line) is only a fallback
+    # when neither cont_y nor a next-Q marker exists.
+    # Do NOT use fw when cont_y is set — writing lines appear between sub-parts
+    se = cont_y or nq
     ab = _s_find_answer_box_top(page, cs, se)
 
     if ab:
@@ -1430,8 +1433,8 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
                 continue
             if y0 >= se:
                 break
-            if _s_is_writing_line(txt):
-                break
+            # Do NOT stop at writing lines — they are PART of the question
+            # (answer blanks appear between sub-parts a/b/c)
             if (_S_FOOTER_PAT.search(txt) or _CONTINUES_PAT.search(txt)
                     or _CONTINUED_PAT.search(txt)):
                 continue
@@ -1504,12 +1507,28 @@ def _crop_qp_full(qp_doc, pg, qn, pg_end: int = 0):
             y += p.size[1]
         return c
 
-    # ── Auto-detect via "continues on following page" ─────────────────────────
-    if not hc:
+    # ── Auto-detect continuation pages ──────────────────────────────────────────
+    # Check two signals:
+    # 1. "this question continues on the following page" (bottom of current page)
+    # 2. "(Question N continued)" at top of next page (used by IB Biology etc.)
+    def _next_page_continues(doc_, curr_pg_1based, qn_):
+        """Return True if the page AFTER curr_pg_1based is a continuation of qn_."""
+        nxt = curr_pg_1based   # 0-based index of the next page
+        if nxt >= len(doc_):
+            return False
+        nxt_txt = doc_[nxt].get_text()
+        # Pattern: "(Question N continued)" near top of the next page
+        return bool(re.search(
+            rf"(?:^|\n)[^\n]{{0,20}}question\s+{qn_}\s+continued",
+            nxt_txt[:500], re.IGNORECASE
+        ))
+
+    # Keep going while either hc (bottom-of-page marker) OR next page continues
+    if not hc and not _next_page_continues(qp_doc, pg, qn):
         return img1
     pieces = [img1]
     pn = pg
-    for _ in range(3):
+    for _ in range(8):   # allow up to 8 continuation pages
         pn += 1
         if pn > len(qp_doc):
             break
@@ -1520,7 +1539,8 @@ def _crop_qp_full(qp_doc, pg, qn, pg_end: int = 0):
         if ic is None:
             break
         pieces.append(ic)
-        if not hc2:
+        # Continue if this page also has a continuation signal or next page does
+        if not hc2 and not _next_page_continues(qp_doc, pn, qn):
             break
     tw = max(p.size[0] for p in pieces)
     th = sum(p.size[1] for p in pieces)
