@@ -2778,90 +2778,17 @@ def build_structured_worksheet(
         ap.paragraph_format.keep_with_next = True
         _s_run(ap, "Answer from Mark Scheme:", bold=True, size_pt=11)
 
-        if ms_imgs or row_to_section.get(ri):
-            # ── Try text extraction first ────────────────────────────────
-            _ms_sec = row_to_section.get(ri)
-            _ms_text_entries = None
-            if _ms_sec and isinstance(_ms_sec, dict):
-                _q_inf2 = _ms_sec.get("questions", {}).get(qn)
-                if _q_inf2:
-                    _ts = _q_inf2.get("page_idx", 0)
-                    _te = _q_inf2.get("end_page_idx", _ts)
-                    _ms_text_entries = _extract_ms_text(ms_doc, _ts, _te, qn)
-
-            if _ms_text_entries:
-                # ── Render as formatted text — PDF example style ─────────
-                for _entry in _ms_text_entries:
-                    _part      = _entry.get("part", "")
-                    _ans_lines = _entry.get("ans_lines", [])
-                    _notes_lst = _entry.get("notes", [])
-                    _tot       = _entry.get("total", "")
-
-                    # ── Part header row: (a), (b), (c)... ───────────────
-                    if _part:
-                        _ph_p = doc.add_paragraph()
-                        _ph_p.paragraph_format.space_before = Pt(6)
-                        _ph_p.paragraph_format.space_after  = Pt(0)
-                        _s_run(_ph_p, f"({_part})", bold=True, size_pt=11)
-
-                    # ── Answer lines ─────────────────────────────────────
-                    for _ln in _ans_lines:
-                        _is_it = _ln.startswith("i:")
-                        _txt   = _ln[2:] if _is_it else _ln
-                        if not _txt.strip():
-                            continue
-                        _ap = doc.add_paragraph()
-                        _ap.paragraph_format.space_before = Pt(0)
-                        _ap.paragraph_format.space_after  = Pt(1)
-                        _ap.paragraph_format.left_indent  = Cm(0.5)
-                        _s_run(_ap, _txt, italic=_is_it, size_pt=10,
-                               color="333333" if _is_it else None)
-
-                    # ── Notes ────────────────────────────────────────────
-                    for _nt in _notes_lst:
-                        if not _nt.strip():
-                            continue
-                        _np = doc.add_paragraph()
-                        _np.paragraph_format.space_before = Pt(1)
-                        _np.paragraph_format.space_after  = Pt(0)
-                        _np.paragraph_format.left_indent  = Cm(0.5)
-                        _s_run(_np, _nt, italic=True, size_pt=9, color="555555")
-
-                    # ── Total marks ───────────────────────────────────────
-                    if _tot and _tot not in ("0", ""):
-                        _tp = doc.add_paragraph()
-                        _tp.paragraph_format.space_before = Pt(2)
-                        _tp.paragraph_format.space_after  = Pt(4)
-                        _tp.paragraph_format.alignment    = 2   # right
-                        _s_run(_tp, f"[{_tot}]", bold=True, size_pt=10,
-                               color="1a1a1a")
-
-                    # Thin separator between parts
-                    _sep = doc.add_paragraph()
-                    _sep.paragraph_format.space_before = Pt(0)
-                    _sep.paragraph_format.space_after  = Pt(0)
-
-                if ms_marks_mismatch:
-                    _warn = doc.add_paragraph()
-                    _s_run(_warn,
-                           f"⚠ Marks mismatch: QP max={r.get('marks',0)} — verify.",
-                           italic=True, size_pt=9, color="CC6600")
-
-            elif ms_imgs:
-                # ── Fall back to image rendering ──────────────────────────
-                for img in ms_imgs:
-                    _s_add_ms_img(doc, img)
-                if ms_marks_mismatch:
-                    _warn = doc.add_paragraph()
-                    _warn.paragraph_format.space_before = Pt(2)
-                    _warn.paragraph_format.space_after  = Pt(2)
-                    _s_run(_warn,
-                           f"⚠ Marks mismatch: QP max={r.get('marks',0)} — verify.",
-                           italic=True, size_pt=9, color="CC6600")
-            else:
-                p = doc.add_paragraph()
-                _s_run(p, "⚠ Mark Scheme not found — please verify manually",
-                       italic=True, size_pt=10, color="CC0000")
+        if ms_imgs:
+            # ── Image rendering — full MS table as-is from source ────────
+            for img in ms_imgs:
+                _s_add_ms_img(doc, img)
+            if ms_marks_mismatch:
+                _warn = doc.add_paragraph()
+                _warn.paragraph_format.space_before = Pt(2)
+                _warn.paragraph_format.space_after  = Pt(2)
+                _s_run(_warn,
+                       f"⚠ Marks mismatch: QP max={r.get('marks',0)} — verify manually.",
+                       italic=True, size_pt=9, color="CC6600")
         else:
             p = doc.add_paragraph()
             _s_run(p, "⚠ Mark Scheme not found — please verify manually",
