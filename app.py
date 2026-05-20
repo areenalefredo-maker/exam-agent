@@ -2228,18 +2228,73 @@ def _crop_ms_biology_range(ms_doc: "fitz.Document",
                             end_pi: int,
                             scale: float = 150 / 72) -> list:
     """
-    Crop MS pages start_pi..end_pi for Biology-style table-format Mark Schemes.
-    Uses _crop_ms_page_redacted to remove Q-number column, headers, and
-    "continued" labels cleanly.
-    Returns list of PIL Images.
+    Crop MS pages start_pi..end_pi as clean full-width images.
+    No redaction — preserves full table (Question/Answers/Notes/Total).
+    Strips only: page header (–N–/©), page footer, "Turn over", "(Question N continued)".
     """
     from PIL import Image as _Img
+    import fitz as _fitz
+    import io as _io
+    import re as _re
+    import numpy as _np
+
     pieces = []
+
     for pi in range(start_pi, min(end_pi + 1, len(ms_doc))):
-        img = _crop_ms_page_redacted(ms_doc, pi, scale=scale)
+        page = ms_doc[pi]
+        ph   = page.rect.height
+        pw   = page.rect.width
+
+        # Detect crop top (skip page header lines)
+        ty = ph * 0.02
+        by = ph * 0.97
+
+        for blk in page.get_text("dict").get("blocks", []):
+            if blk.get("type") != 0:
+                continue
+            for ln in blk.get("lines", []):
+                txt = "".join(s.get("text","") for s in ln.get("spans",[])).strip()
+                bb  = ln["bbox"]
+                # Skip page header
+                if bb[1] < ph * 0.12 and _re.search(
+                    r"–\s*\d+\s*–|\d{4}[\-–]\d{4}M?|©", txt
+                ):
+                    ty = max(ty, bb[3] + 3)
+                # Skip "(Question N continued)" header line
+                if _re.search(r"\(?[Qq]uestion\s+\d+\s+continued\)?", txt, _re.I):
+                    ty = max(ty, bb[3] + 3)
+                # Skip page footer (bare number near bottom)
+                if bb[1] > ph * 0.91 and _re.match(r"^\d{1,4}$", txt):
+                    by = min(by, bb[1] - 2)
+                # Skip "Turn over"
+                if _re.match(r"^Turn\s+over$", txt, _re.I):
+                    by = min(by, bb[1] - 2)
+
+        if by <= ty + 20:
+            continue
+
+        clip = _fitz.Rect(0, ty, pw, by)
+        pix  = page.get_pixmap(
+            matrix=_fitz.Matrix(scale, scale),
+            clip=clip,
+            alpha=False
+        )
+        img = _Img.open(_io.BytesIO(pix.tobytes("png"))).copy()
+
+        # Trim trailing whitespace rows at bottom only
+        arr = _np.array(img)
+        rm  = arr.min(axis=(1, 2))
+        dk  = _np.where(rm < 248)[0]
+        if len(dk) > 0:
+            img = img.crop((0, 0, img.width, min(int(dk[-1]) + 12, img.height)))
+
         if img.height > 20:
             pieces.append(img)
+
     return pieces
+
+
+
 def _crop_ms_pieces(ms_doc, q_info):
     spi = q_info["page_idx"]
     epi = q_info.get("end_page_idx", spi)
