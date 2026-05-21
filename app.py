@@ -3409,37 +3409,77 @@ if st.button(
         n_segs = len(segments)
         n_ms   = len(ms_sections)
 
-        # Log the mapping for debugging
-        st.write(f"🔗 Matching {len(segments)} Excel segments to {n_ms} MS sections "
-                 f"(method: {match_method if 'match_method' in dir() else 'Direct QP-session'})")
+        # ── CODE-BASED matching: Excel ref code → MS session ─────────────────
+        # Build {exam_code: ms_section_index} by scanning the MS PDF for codes
+        _ms_code_to_idx: dict[str, int] = {}
+        try:
+            _ms_scan = fitz.open(stream=ms_bytes, filetype="pdf")
+            _prev_ms_code = None
+            for _pi in range(len(_ms_scan)):
+                _ptxt = _ms_scan[_pi].get_text()
+                import re as _re2
+                for _m1, _m2 in _re2.findall(r"(\d{4})\s*[–\-]\s*(\d{4})M?\b", _ptxt):
+                    _code = f"{_m1}-{_m2}"
+                    if _code != _prev_ms_code and len(_m1)==4 and len(_m2)==4:
+                        # Find matching ms_sections entry by start_page proximity
+                        for _si, _sec in enumerate(ms_sections):
+                            _sp = _sec.get("start_page", 0)
+                            if abs(_sp - (_pi+1)) <= 5:
+                                _ms_code_to_idx[_code] = _si
+                                break
+                        _prev_ms_code = _code
+                        break
+            _ms_scan.close()
+        except Exception:
+            _ms_code_to_idx = {}
 
-        for seg_pos, seg_rows in enumerate(segments):
-            # QP session index stored during segment building
-            qp_sidx = (segment_qp_sidx[seg_pos]
-                       if seg_pos < len(segment_qp_sidx) else seg_pos)
-            # Direct: MS section at same position as QP session
-            if qp_sidx < n_ms:
-                ms_idx = qp_sidx
-                sec    = ms_sections[ms_idx]
-            elif n_ms > 0:
-                ms_idx = n_ms - 1          # last available section
-                sec    = ms_sections[ms_idx]
+        # Group rows by their ref code (preserving Excel order)
+        _ref_order: list[str] = []
+        _ref_rows:  dict[str, list[int]] = {}
+        for _ri, _row in enumerate(xl_rows):
+            _raw_ref = _row.get("ref", "") or ""
+            import re as _re3
+            _cm = _re3.search(r"(\d{4})[^\d]+(\d{4})", _raw_ref)
+            _code = f"{_cm.group(1)}-{_cm.group(2)}" if _cm else _raw_ref[:20]
+            if not _ref_order or _ref_order[-1] != _code:
+                _ref_order.append(_code)
+            _ref_rows.setdefault(_code, []).append(_ri)
+
+        # Build row_to_section using code-based lookup
+        _exam_order_idx = 0   # fallback positional index if code not found
+        for _code in _ref_order:
+            _rows_for_code = _ref_rows[_code]
+            _ms_idx = _ms_code_to_idx.get(_code)
+
+            if _ms_idx is None:
+                # Try fuzzy: same last 4 digits (session suffix match)
+                _suffix = _code[-4:] if len(_code)>=4 else ""
+                for _c2, _i2 in _ms_code_to_idx.items():
+                    if _c2.endswith(_suffix) and _suffix:
+                        _ms_idx = _i2
+                        break
+
+            if _ms_idx is not None and 0 <= _ms_idx < n_ms:
+                _sec = ms_sections[_ms_idx]
+            elif _exam_order_idx < n_ms:
+                # Positional fallback
+                _ms_idx = _exam_order_idx
+                _sec    = ms_sections[_ms_idx]
                 mismatch_warnings.append(
-                    f"Segment {seg_pos+1} (QP session {qp_sidx+1}) beyond "
-                    f"MS range ({n_ms} sections) — using last section"
+                    f"Exam {_code}: no MS code match — using section {_ms_idx+1} positionally"
                 )
             else:
-                ms_idx = -1
-                sec    = None
-                mismatch_warnings.append(f"Segment {seg_pos+1}: no MS sections")
+                _ms_idx = -1
+                _sec    = None
+                mismatch_warnings.append(f"Exam {_code}: no MS section available")
 
-            for ri in seg_rows:
-                row_to_section[ri]     = sec
-                row_to_section_idx[ri] = ms_idx
+            for _ri in _rows_for_code:
+                row_to_section[_ri]     = _sec
+                row_to_section_idx[_ri] = _ms_idx
 
-        match_method = (f"Direct QP-session order "
-                        f"({n_segs} Excel segments → {n_ms} MS sections, "
-                        f"ratio={n_ms/max(n_segs,1):.2f})")
+            _exam_order_idx += 1
+
+        match_method = "Code-based (exam ref → MS exam code)"
 
         # Compute actual segment max question numbers for display
         seg_max_qns = []
