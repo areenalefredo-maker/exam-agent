@@ -3455,35 +3455,115 @@ if st.button(
         _ms_code_debug: list[dict] = []   # for debug table
 
         try:
-            _ms_scan_tmp = fitz.open(stream=ms_bytes, filetype="pdf")
+            _ms_scan_tmp  = fitz.open(stream=ms_bytes, filetype="pdf")
             _prev_ms_code2 = None
+
+            # Helper: nearest ms_sections entry for a given MS page index
+            def _nearest_sec(pi_):
+                best_si_, best_d_ = -1, 999
+                for si_, sc_ in enumerate(ms_sections):
+                    d_ = abs(sc_.get("start_page", 0) - (pi_ + 1))
+                    if d_ < best_d_:
+                        best_d_ = d_; best_si_ = si_
+                return (best_si_, best_d_)
+
+            # Also store IB paper code → ms section index
+            # IB code format: M21/4/BIOLO/HP2/ENG/TZN/XX/M
+            _ib_code_to_idx: dict[str, int] = {}
+            _ib_pat = re.compile(
+                r"([MN]\d{2})/4/BIOLO/HP2/ENG/TZ(\d)/XX/M"
+            )
+            _prev_ib_code = None
+
             for _pi2 in range(len(_ms_scan_tmp)):
                 _ptxt2 = _ms_scan_tmp[_pi2].get_text()
+
+                # ── Numeric code scan (e.g. "8823-6008") ──────────────────
                 for _m1, _m2 in re.findall(r"(\d{4})\s*[–\-]\s*(\d{4})M?\b", _ptxt2):
                     _code2 = f"{_m1}-{_m2}"
                     if _code2 == _prev_ms_code2 or len(_m1) != 4:
                         continue
-                    # Find the ms_sections entry whose start_page is near this page
-                    _best_si = -1; _best_dist = 999
-                    for _si2, _sec2 in enumerate(ms_sections):
-                        _sp2 = _sec2.get("start_page", 0)
-                        _dist = abs(_sp2 - (_pi2 + 1))
-                        if _dist < _best_dist:
-                            _best_dist = _dist; _best_si = _si2
-                    if _best_si >= 0 and _best_dist <= 20:
-                        _ms_code_to_idx[_code2] = _best_si
+                    if _m1[0] not in ("2","8") or _m2[0] not in ("6","9"):
+                        _prev_ms_code2 = _code2; break
+                    _bsi, _bd = _nearest_sec(_pi2)
+                    if _bsi >= 0 and _bd <= 25 and _code2 not in _ms_code_to_idx:
+                        _ms_code_to_idx[_code2] = _bsi
                         _ms_code_debug.append({
                             "MS Exam Code": _code2,
-                            "Code found at MS p": _pi2 + 1,
-                            "Matched section #": _best_si + 1,
-                            "Section start_page": ms_sections[_best_si].get("start_page", "?"),
-                            "Q# in section": sorted(ms_sections[_best_si].get("questions", {}).keys()),
+                            "Format": "numeric",
+                            "Code at MS p": _pi2 + 1,
+                            "→ section #": _bsi + 1,
+                            "start_page": ms_sections[_bsi].get("start_page", "?"),
+                            "Qs": sorted(ms_sections[_bsi].get("questions", {}).keys()),
                         })
-                    _prev_ms_code2 = _code2
-                    break
+                    _prev_ms_code2 = _code2; break
+
+                # ── IB paper code scan (e.g. "N21/4/BIOLO/HP2/ENG/TZ0/XX/M") ─
+                _ib_m = _ib_pat.search(_ptxt2)
+                if _ib_m:
+                    _ib_code = _ib_m.group(0)
+                    if _ib_code != _prev_ib_code:
+                        _bsi, _bd = _nearest_sec(_pi2)
+                        if _bsi >= 0 and _bd <= 25 and _ib_code not in _ib_code_to_idx:
+                            _ib_code_to_idx[_ib_code] = _bsi
+                            _ms_code_debug.append({
+                                "MS Exam Code": _ib_code,
+                                "Format": "IB-paper-code",
+                                "Code at MS p": _pi2 + 1,
+                                "→ section #": _bsi + 1,
+                                "start_page": ms_sections[_bsi].get("start_page", "?"),
+                                "Qs": sorted(ms_sections[_bsi].get("questions", {}).keys()),
+                            })
+                        _prev_ib_code = _ib_code
+
             _ms_scan_tmp.close()
-        except Exception as _e_ms:
+
+            # ── Decode Excel reference text to IB paper codes ────────────
+            # Uses the full ref string e.g. "8821-6002 (Wednesday 27 October 2021)"
+            # to find the correct IB code format M21/N21 etc.
+            def _excel_to_ib_code(ref_text: str) -> list[str]:
+                """Return candidate IB paper codes from full Excel reference text."""
+                import re as _re2
+                if not ref_text:
+                    return []
+                # Extract date from parenthetical: "19 May 2021" or "May 2022"
+                _dm = _re2.search(
+                    r"(?:\d+\s+)?(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|"
+                    r"Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|"
+                    r"Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)"
+                    r"\s+(\d{4})",
+                    ref_text, _re2.I
+                )
+                if _dm:
+                    _mon = _dm.group(1)[:3].title()
+                    _yr  = _dm.group(2)[-2:]
+                    _NOV = {"Oct","Nov","Dec"}
+                    _sess = "N" if _mon in _NOV else "M"
+                else:
+                    # Fallback: decode from leading digits e.g. "8821" → N, "21"
+                    _cm2 = _re2.match(r"(\d)(\d{2})", ref_text)
+                    if not _cm2:
+                        return []
+                    _sess = "N" if _cm2.group(1) == "8" else "M"
+                    _yr   = _cm2.group(2)
+                # TZ from paper suffix
+                _pm = _re2.search(r"-(\d{4})", ref_text)
+                _paper = _pm.group(1) if _pm else ""
+                _tz = "0"
+                if _paper in ("6008","6021","6028","9501"):
+                    _tz = "1"
+                elif _paper in ("6014","6015","6036"):
+                    _tz = "2"
+                _others = [t_ for t_ in ("0","1","2") if t_ != _tz]
+                return [
+                    f"{_sess}{_yr}/4/BIOLO/HP2/ENG/TZ{t_}/XX/M"
+                    for t_ in [_tz] + _others
+                ]
+
+        except Exception:
             _ms_code_to_idx = {}
+            _ib_code_to_idx = {}
+            _excel_to_ib_code = lambda c: []
 
         # ── Group Excel rows by ref code (preserving order) ────────────────────
         _ref_order2: list[str] = []
@@ -3499,29 +3579,59 @@ if st.button(
         # ── Assign each row to its MS section (or None) ─────────────────────────
         _match_debug: list[dict] = []   # for debug table
 
+        _positional_ptr = 0   # pointer for positional fallback
+
         for _code2 in _ref_order2:
             _rows_for_code = _ref_rows2[_code2]
-            _ms_idx2 = _ms_code_to_idx.get(_code2)
+            _ms_idx2  = -1
+            _sec2     = None
+            _method2  = "Not found"
 
-            if _ms_idx2 is not None and 0 <= _ms_idx2 < n_ms:
+            # ── 1. Direct code match ───────────────────────────────────────
+            _direct = _ms_code_to_idx.get(_code2)
+            if _direct is not None and 0 <= _direct < n_ms:
+                _ms_idx2 = _direct; _method2 = "Code match"
+
+            # ── 2. IB paper code match (via decoded Excel ref text) ──────
+            if _ms_idx2 < 0:
+                # Pass the FULL ref string (with date) for accurate year/session decode
+                _full_ref2 = _ref_rows2[_code2]   # list of row indices
+                _full_ref_str = (xl_rows[_full_ref2[0]].get("ref","") if _full_ref2
+                                 else _code2)
+                for _ib_cand in _excel_to_ib_code(_full_ref_str):
+                    _ib_si = _ib_code_to_idx.get(_ib_cand)
+                    if _ib_si is not None and 0 <= _ib_si < n_ms:
+                        _ms_idx2 = _ib_si; _method2 = f"IB code ({_ib_cand})"
+                        break
+
+            # ── 3. Positional fallback ─────────────────────────────────────
+            if _ms_idx2 < 0 and _positional_ptr < n_ms:
+                # Skip already-assigned sections
+                while (_positional_ptr < n_ms and
+                       _positional_ptr in set(row_to_section_idx.values())):
+                    _positional_ptr += 1
+                if _positional_ptr < n_ms:
+                    _ms_idx2 = _positional_ptr
+                    _method2 = f"Positional fallback (#{_positional_ptr + 1})"
+                    _positional_ptr += 1
+
+            if _ms_idx2 >= 0:
                 _sec2    = ms_sections[_ms_idx2]
                 _status2 = "Matched"
             else:
-                # No MS available for this exam — do NOT assign wrong section
-                _ms_idx2 = -1
-                _sec2    = None
                 _status2 = "MS block not found"
                 mismatch_warnings.append(
-                    f"Exam {_code2}: no MS available in uploaded file"
+                    f"Exam {_code2}: no MS block after all fallbacks"
                 )
 
             _match_debug.append({
-                "QP Exam Code": _code2,
-                "# rows": len(_rows_for_code),
-                "MS Section #": (_ms_idx2 + 1) if _ms_idx2 >= 0 else "—",
-                "MS section Qs": (sorted(_sec2.get("questions", {}).keys())
+                "QP Exam Code":  _code2,
+                "# rows":        len(_rows_for_code),
+                "MS Section #":  (_ms_idx2 + 1) if _ms_idx2 >= 0 else "—",
+                "Match Method":  _method2,
+                "Match Status":  _status2,
+                "MS Qs":         (sorted(_sec2.get("questions", {}).keys())
                                   if _sec2 else []),
-                "Match Status": _status2,
             })
 
             for _ri2 in _rows_for_code:
