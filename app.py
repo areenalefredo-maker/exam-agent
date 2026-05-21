@@ -3430,77 +3430,95 @@ if st.button(
         n_segs = len(segments)
         n_ms   = len(ms_sections)
 
-        # ── CODE-BASED matching: Excel ref code → MS session ─────────────────
-        # Build {exam_code: ms_section_index} by scanning the MS PDF for codes
+        # ── CODE-BASED matching: Excel ref → MS exam code ─────────────────────
+        # 1. Extract exam codes from MS PDF (e.g. "8823-6008")
+        # 2. Match each MS code → ms_sections entry by start_page proximity
+        # 3. For each Excel exam block, look up its code → MS section
+        # 4. No MS = sec=None (shown as "MS block not found")
+
         _ms_code_to_idx: dict[str, int] = {}
+        _ms_code_debug: list[dict] = []   # for debug table
+
         try:
-            _ms_scan = fitz.open(stream=ms_bytes, filetype="pdf")
-            _prev_ms_code = None
-            for _pi in range(len(_ms_scan)):
-                _ptxt = _ms_scan[_pi].get_text()
-                import re as _re2
-                for _m1, _m2 in _re2.findall(r"(\d{4})\s*[–\-]\s*(\d{4})M?\b", _ptxt):
-                    _code = f"{_m1}-{_m2}"
-                    if _code != _prev_ms_code and len(_m1)==4 and len(_m2)==4:
-                        # Find matching ms_sections entry by start_page proximity
-                        for _si, _sec in enumerate(ms_sections):
-                            _sp = _sec.get("start_page", 0)
-                            if abs(_sp - (_pi+1)) <= 5:
-                                _ms_code_to_idx[_code] = _si
-                                break
-                        _prev_ms_code = _code
-                        break
-            _ms_scan.close()
-        except Exception:
+            _ms_scan_tmp = fitz.open(stream=ms_bytes, filetype="pdf")
+            _prev_ms_code2 = None
+            for _pi2 in range(len(_ms_scan_tmp)):
+                _ptxt2 = _ms_scan_tmp[_pi2].get_text()
+                for _m1, _m2 in re.findall(r"(\d{4})\s*[–\-]\s*(\d{4})M?\b", _ptxt2):
+                    _code2 = f"{_m1}-{_m2}"
+                    if _code2 == _prev_ms_code2 or len(_m1) != 4:
+                        continue
+                    # Find the ms_sections entry whose start_page is near this page
+                    _best_si = -1; _best_dist = 999
+                    for _si2, _sec2 in enumerate(ms_sections):
+                        _sp2 = _sec2.get("start_page", 0)
+                        _dist = abs(_sp2 - (_pi2 + 1))
+                        if _dist < _best_dist:
+                            _best_dist = _dist; _best_si = _si2
+                    if _best_si >= 0 and _best_dist <= 20:
+                        _ms_code_to_idx[_code2] = _best_si
+                        _ms_code_debug.append({
+                            "MS Exam Code": _code2,
+                            "Code found at MS p": _pi2 + 1,
+                            "Matched section #": _best_si + 1,
+                            "Section start_page": ms_sections[_best_si].get("start_page", "?"),
+                            "Q# in section": sorted(ms_sections[_best_si].get("questions", {}).keys()),
+                        })
+                    _prev_ms_code2 = _code2
+                    break
+            _ms_scan_tmp.close()
+        except Exception as _e_ms:
             _ms_code_to_idx = {}
 
-        # Group rows by their ref code (preserving Excel order)
-        _ref_order: list[str] = []
-        _ref_rows:  dict[str, list[int]] = {}
-        for _ri, _row in enumerate(xl_rows):
-            _raw_ref = _row.get("ref", "") or ""
-            import re as _re3
-            _cm = _re3.search(r"(\d{4})[^\d]+(\d{4})", _raw_ref)
-            _code = f"{_cm.group(1)}-{_cm.group(2)}" if _cm else _raw_ref[:20]
-            if not _ref_order or _ref_order[-1] != _code:
-                _ref_order.append(_code)
-            _ref_rows.setdefault(_code, []).append(_ri)
+        # ── Group Excel rows by ref code (preserving order) ────────────────────
+        _ref_order2: list[str] = []
+        _ref_rows2: dict[str, list[int]] = {}
+        for _ri2, _row2 in enumerate(xl_rows):
+            _raw_ref2 = _row2.get("ref", "") or ""
+            _cm2 = re.search(r"(\d{4})[^\d]+(\d{4})", _raw_ref2)
+            _code2 = f"{_cm2.group(1)}-{_cm2.group(2)}" if _cm2 else _raw_ref2[:20]
+            if not _ref_order2 or _ref_order2[-1] != _code2:
+                _ref_order2.append(_code2)
+            _ref_rows2.setdefault(_code2, []).append(_ri2)
 
-        # Build row_to_section using code-based lookup
-        _exam_order_idx = 0   # fallback positional index if code not found
-        for _code in _ref_order:
-            _rows_for_code = _ref_rows[_code]
-            _ms_idx = _ms_code_to_idx.get(_code)
+        # ── Assign each row to its MS section (or None) ─────────────────────────
+        _match_debug: list[dict] = []   # for debug table
 
-            if _ms_idx is None:
-                # Try fuzzy: same last 4 digits (session suffix match)
-                _suffix = _code[-4:] if len(_code)>=4 else ""
-                for _c2, _i2 in _ms_code_to_idx.items():
-                    if _c2.endswith(_suffix) and _suffix:
-                        _ms_idx = _i2
-                        break
+        for _code2 in _ref_order2:
+            _rows_for_code = _ref_rows2[_code2]
+            _ms_idx2 = _ms_code_to_idx.get(_code2)
 
-            if _ms_idx is not None and 0 <= _ms_idx < n_ms:
-                _sec = ms_sections[_ms_idx]
-            elif _exam_order_idx < n_ms:
-                # Positional fallback
-                _ms_idx = _exam_order_idx
-                _sec    = ms_sections[_ms_idx]
-                mismatch_warnings.append(
-                    f"Exam {_code}: no MS code match — using section {_ms_idx+1} positionally"
-                )
+            if _ms_idx2 is not None and 0 <= _ms_idx2 < n_ms:
+                _sec2    = ms_sections[_ms_idx2]
+                _status2 = "Matched"
             else:
-                _ms_idx = -1
-                _sec    = None
-                mismatch_warnings.append(f"Exam {_code}: no MS section available")
+                # No MS available for this exam — do NOT assign wrong section
+                _ms_idx2 = -1
+                _sec2    = None
+                _status2 = "MS block not found"
+                mismatch_warnings.append(
+                    f"Exam {_code2}: no MS available in uploaded file"
+                )
 
-            for _ri in _rows_for_code:
-                row_to_section[_ri]     = _sec
-                row_to_section_idx[_ri] = _ms_idx
+            _match_debug.append({
+                "QP Exam Code": _code2,
+                "# rows": len(_rows_for_code),
+                "MS Section #": (_ms_idx2 + 1) if _ms_idx2 >= 0 else "—",
+                "MS section Qs": (sorted(_sec2.get("questions", {}).keys())
+                                  if _sec2 else []),
+                "Match Status": _status2,
+            })
 
-            _exam_order_idx += 1
+            for _ri2 in _rows_for_code:
+                row_to_section[_ri2]     = _sec2
+                row_to_section_idx[_ri2] = _ms_idx2
 
         match_method = "Code-based (exam ref → MS exam code)"
+
+        # ── Store debug tables for UI display ──────────────────────────────────
+        st.session_state["_ms_code_debug"]  = _ms_code_debug
+        st.session_state["_match_debug"]    = _match_debug
+
 
         # Compute actual segment max question numbers for display
         seg_max_qns = []
@@ -3523,36 +3541,37 @@ if st.button(
         unpaired_segs  = mismatch_warnings
 
         if is_structured:
-            match_table = []
-            for seg_idx, seg_rows in enumerate(segments):
-                ms_sec_i = row_to_section_idx.get(seg_rows[0], -1)
-                ms_sec   = row_to_section.get(seg_rows[0])
-                ms_code  = (ms_sec.get("paper_code") if isinstance(ms_sec, dict) else None)
-                ref_str  = xl_rows[seg_rows[0]].get("ref", "") if seg_rows else ""
-                seg_mq   = seg_max_qns[seg_idx]
-                ms_mq    = _ms_max_qn(ms_sec) if ms_sec else 0
-                ok       = seg_mq == 0 or ms_mq == 0 or abs(ms_mq - seg_mq) <= 3
-                match_table.append({
-                    "Seg#":        seg_idx + 1,
-                    "Excel Ref":   ref_str[:40],
-                    "Seg max Q":   seg_mq,
-                    "MS section#": ms_sec_i + 1 if ms_sec_i >= 0 else "—",
-                    "MS max Q":    ms_mq or "—",
-                    "Match":       "✅" if ok else "⚠️",
-                    "MS Qs avail": len(ms_sec.get("questions", {})) if ms_sec else 0,
-                })
-            n_warn = len([r for r in match_table if r["Match"] == "⚠️"])
+            # ── Exam ↔ MS block debug tables ───────────────────────────────────
+            _md = st.session_state.get("_ms_code_debug", [])
+            _xd = st.session_state.get("_match_debug", [])
+            n_no_ms = sum(1 for r in _xd if r.get("Match Status") == "MS block not found")
+
             with st.expander(
-                f"📋 Paper ↔ MS Matching — {match_method}  "
-                f"({'⚠️ ' + str(n_warn) + ' mismatches' if n_warn else '✅ all OK'})",
-                expanded=(n_warn > 0)
+                f"📋 MS Blocks Detected ({len(_md)} exam blocks found in MS file)",
+                expanded=False
             ):
-                st.dataframe(match_table, use_container_width=True, hide_index=True)
-                if n_warn:
+                if _md:
+                    st.dataframe(_md, use_container_width=True, hide_index=True)
+                else:
+                    st.warning("No MS exam blocks detected. Check if MS PDF codes match Excel references.")
+
+            with st.expander(
+                f"🔗 Exam ↔ MS Matching "
+                f"({'⚠️ ' + str(n_no_ms) + ' exams without MS' if n_no_ms else '✅ all matched'})",
+                expanded=(n_no_ms > 0)
+            ):
+                if _xd:
+                    st.dataframe(_xd, use_container_width=True, hide_index=True)
+                if n_no_ms:
                     st.warning(
-                        f"⚠️ {n_warn} segment(s) may have mismatched MS sections. "
-                        "Details:\n" + "\n".join(f"• {w}" for w in mismatch_warnings)
+                        f"⚠️ {n_no_ms} exam(s) have no MS block in the uploaded MS file.\n"
+                        "These questions will show 'MS block not found' in the preview.\n"
+                        "Upload a MS file that includes these exams to fix this."
                     )
+                if mismatch_warnings:
+                    with st.expander("Details", expanded=False):
+                        for w in mismatch_warnings[:20]:
+                            st.write(f"• {w}")
 
         if len(ms_sections) != len(segments):
             ratio = len(ms_sections) / max(len(segments), 1)
@@ -3756,15 +3775,21 @@ if st.button(
             else:
                 problems.append(f"Q{q['qn']} not located on page {q['page_num']} of QP")
         if not q["answerFound"] and not q.get("_ms_image"):
-            if "Structured" in (q.get("_mode") or ""):
-                problems.append(f"Q{q['qn']} not found in MS section")
+            _ms_sec_label = q.get("_ms_section", "")
+            if "no section" in _ms_sec_label or _ms_sec_label == "":
+                problems.append("MS block not found — MS file does not contain this exam")
+            elif "Structured" in (q.get("_mode") or ""):
+                problems.append(f"Answer missing inside MS block ({_ms_sec_label})")
             elif "MCQ" in (q.get("_mode") or ""):
-                problems.append(f"Q{q['qn']} has no A/B/C/D answer")
+                problems.append(f"Q{q['qn']} has no A/B/C/D answer in MS block")
         if problems:
             unmatched.append({
-                "Excel Row": i + 2, "Reference": q.get("ref", ""),
-                "Q#": q["qn"], "Page (Excel)": q.get("page_num", 0),
-                "Reason": " · ".join(problems),
+                "Excel Row":   i + 2,
+                "Reference":   q.get("ref", ""),
+                "Q#":          q["qn"],
+                "Page (Excel)": q.get("page_num", 0),
+                "MS Section":  q.get("_ms_section", "—"),
+                "Reason":      " · ".join(problems),
             })
 
     qp_match_pct    = found_qp / max(total, 1)
