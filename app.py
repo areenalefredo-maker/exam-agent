@@ -3298,14 +3298,29 @@ if st.button(
         # This guarantees: Excel segment N = QP session N = MS section N (positional).
         qp_session_starts: list[int] = []   # QP page numbers (1-based) where each exam starts
         try:
-            _qp_tmp = fitz.open(stream=qp_bytes, filetype="pdf")
+            _qp_tmp  = fitz.open(stream=qp_bytes, filetype="pdf")
+            _prev_qp_code = None
             for _pi in range(len(_qp_tmp)):
                 _pg_txt = _qp_tmp[_pi].get_text()
-                # Try multiple patterns to handle different PDF text encodings
-                if (re.search(r"1[.][\s\x07]*\[Maximum mark", _pg_txt) or
-                        re.search(r"^\s*1\.\s*\[Maximum mark", _pg_txt, re.M) or
-                        re.search(r"1\.\s{0,10}Maximum mark", _pg_txt)):
-                    qp_session_starts.append(_pi + 1)   # 1-based page number
+                # Detect new exam session by first appearance of a new exam code
+                # IB Biology QP uses "YYYYM – SSSS" codes (not "[Maximum mark]")
+                _cm = re.search(
+                    r"(\d{4})\s*[\u2009\u2012\u2013\u2014\-–]\s*(\d{4})\b",
+                    _pg_txt
+                )
+                if _cm:
+                    _c1, _c2 = _cm.group(1), _cm.group(2)
+                    # Real IB codes: first group starts with 2 or 8, second with 6 or 9
+                    if _c1[0] in ("2","8") and _c2[0] in ("6","9"):
+                        _new_code = f"{_c1}-{_c2}"
+                        if _new_code != _prev_qp_code:
+                            qp_session_starts.append(_pi + 1)
+                            _prev_qp_code = _new_code
+                # Also support Math/other subjects that use "[Maximum mark]" format
+                elif (re.search(r"1[.][\s\x07]*\[Maximum mark", _pg_txt) or
+                      re.search(r"^\s*1\.\s*\[Maximum mark", _pg_txt, re.M)):
+                    if not _prev_qp_code:   # only if code-based didn't fire
+                        qp_session_starts.append(_pi + 1)
             _qp_tmp.close()
         except Exception:
             qp_session_starts = []
