@@ -1424,7 +1424,10 @@ def _crop_qp_page(qp_doc, pg_idx, qn, is_cont=False):
     se = cont_y or nq
     ab = _s_find_answer_box_top(page, cs, se)
 
-    if ab:
+    # Only use ab as the crop boundary if it's near the bottom of the range
+    # (>= 70% of the way between cs and se). Lines earlier than that are
+    # answer space lines BETWEEN sub-parts — not a final answer box.
+    if ab and (ab - cs) >= (se - cs) * 0.70:
         ce = ab - 1
     else:
         lc = cs
