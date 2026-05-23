@@ -1012,27 +1012,12 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
     if len(merged_secs) != len(sections):
         sections = merged_secs
 
-    # Filter: remove sections with anomalous question numbers (merged artifacts)
-    # and sections missing Q1 (not a real answer section start)
+    # Filter: remove only stub sections (< 2 questions)
+    # Do NOT require Q1 — Section B blocks start at Q6/Q7/Q8
+    # Do NOT check gaps — IB papers can skip question numbers
     def _is_valid_section(s):
         qs = set(s["questions"].keys())
-        if len(qs) < 3:
-            return False
-        if 1 not in qs:
-            return False   # missing Q1 = not a real section
-        max_q = max(qs)
-        # Check for outlier Q numbers that indicate a merged/corrupt section
-        # e.g. qs=[1,2,3,4,5,8] — Q8 is outlier when max expected is 5
-        expected_range = range(1, max_q + 1)
-        valid_qs = {q for q in qs if q <= max_q}
-        # Any question > 1.6x the second-highest is an outlier
-        sorted_qs = sorted(qs)
-        if len(sorted_qs) >= 2:
-            second_max = sorted_qs[-2]
-            top_q = sorted_qs[-1]
-            if top_q > second_max + 1:
-                return False   # outlier top question (gap > 1 from second-highest)
-        return True
+        return len(qs) >= 2   # at least 2 questions to be a real section
 
     sections = [s for s in sections if _is_valid_section(s)]
 
@@ -3605,15 +3590,11 @@ if st.button(
                         break
 
             # ── 3. Positional fallback ─────────────────────────────────────
+            # When code and IB matching fail, map exam N → ms_section N in order
             if _ms_idx2 < 0 and _positional_ptr < n_ms:
-                # Skip already-assigned sections
-                while (_positional_ptr < n_ms and
-                       _positional_ptr in set(row_to_section_idx.values())):
-                    _positional_ptr += 1
-                if _positional_ptr < n_ms:
-                    _ms_idx2 = _positional_ptr
-                    _method2 = f"Positional fallback (#{_positional_ptr + 1})"
-                    _positional_ptr += 1
+                _ms_idx2 = _positional_ptr
+                _method2 = f"Positional fallback (#{_positional_ptr + 1})"
+                _positional_ptr += 1
 
             if _ms_idx2 >= 0:
                 _sec2    = ms_sections[_ms_idx2]
