@@ -1670,12 +1670,18 @@ def find_biology_ms_q_boundaries(ms_doc, session_start_pi: int,
     for i, qn in enumerate(q_sorted):
         start = q_first[qn]
         if i + 1 < len(q_sorted):
-            # End = page BEFORE next question starts (or same page if they share)
             next_start = q_first[q_sorted[i + 1]]
-            end = max(start, next_start - 1)
+            if next_start == start:
+                # Same page: this question ends on the same page as the next one starts
+                # Include the shared page so the full answer is captured
+                end = start
+            else:
+                # Different page: end at page BEFORE next question starts
+                end = next_start - 1
         else:
             end = session_end_pi
-        boundaries[qn] = (start, end)
+        # Ensure end >= start
+        boundaries[qn] = (start, max(start, end))
 
     return boundaries
 
@@ -2265,14 +2271,15 @@ def _crop_ms_biology_range(ms_doc: "fitz.Document",
         ph   = page.rect.height
         pw   = page.rect.width
 
-        # Skip instruction/rubric pages — they are NOT answer content
+        # Skip instruction/rubric pages — ONLY if they have NO answer content
         _page_txt = page.get_text()
-        if _MS_BIOLOGY_INSTR_PAT.search(_page_txt):
+        _has_answer_content = bool(_re.search(r"(?m)^\s*\d{1,2}\.\s+[a-z]", _page_txt))
+        if _MS_BIOLOGY_INSTR_PAT.search(_page_txt) and not _has_answer_content:
             continue
-        # Skip pure cover/separator pages (Markscheme title pages)
-        if _re.search(r"Markscheme\s+(?:May|November|March|October)", _page_txt, _re.I):
-            if not _re.search(r"(?m)^\s*\d{1,2}\.\s+[a-z]", _page_txt):
-                continue
+        # Skip pure cover/separator pages (Markscheme title pages) without answers
+        if (_re.search(r"Markscheme\s+(?:May|November|March|October)", _page_txt, _re.I)
+                and not _has_answer_content):
+            continue
 
         # Detect crop top (skip page header lines)
         ty = ph * 0.02
@@ -2695,7 +2702,9 @@ def build_structured_worksheet(
                         rf"(?:^|\n)\s*{qn+1}\s*\.\s+[a-z]", _t2, re.MULTILINE
                     ):
                         break
-                    if re.search(r"Total[:\s]", _t2, re.I):
+                    # Only stop at "Total" when it has a digit (actual mark total)
+                    # NOT at table header "Total" column heading
+                    if re.search(r"Total[:\s]+\d", _t2, re.I):
                         _qi["end_page_idx"] = _tpi
                         _qi["end_y"]        = ms_doc[_tpi].rect.height * 0.98
                         break
