@@ -2595,10 +2595,24 @@ def build_structured_worksheet(
         r["_topic_norm"] = _normalize_topic(r.get("topic", ""))
 
     # Sort by QP page, then by question number within page
+    # ── Sort rows by Chapter number first, then by exam order, then by Q# ──
+    import re as _re_sort
+
+    def _chapter_sort_key(ri_r):
+        ri_, r_ = ri_r
+        topic_  = r_.get("topic", "") or ""
+        # Normalize: "# 1. Cell Biology" → chapter_num=1
+        _clean  = _re_sort.sub(r"^#+\s*", "", topic_).strip()
+        _cm     = _re_sort.match(r"^(\d+)", _clean)
+        ch_num  = int(_cm.group(1)) if _cm else 999  # 999 = no chapter → last
+        # Secondary sort: exam order (by page_num in QP), then Q#
+        pg_num  = r_.get("page_num", 9999) or 9999
+        qn_num  = r_.get("qn", 0) or 0
+        return (ch_num, pg_num, qn_num)
+
     ordered_rows = sorted(
         [(ri, r) for ri, r in enumerate(xl_rows)],
-        key=lambda x: (x[1].get("page_num", 9999) or 9999,
-                       x[1].get("qn", 0) or 0)
+        key=_chapter_sort_key
     )
 
     total_qs = len(ordered_rows)
@@ -2636,17 +2650,12 @@ def build_structured_worksheet(
             q_info = sec.get("questions", {}).get(qn)
             if q_info is None:
                 q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+            # NOTE: keyword-based section override is DISABLED.
+            # We must match based on exam order, NOT answer keywords.
+            # Keywords can match answers from different exams → wrong attribution.
+            # The correct section is already set by row_to_section[ri].
             excel_ms_text = r.get("ms_text", "")
-            if excel_ms_text:
-                keywords = _extract_answer_keywords(excel_ms_text)
-                if keywords:
-                    kw_sec, kw_idx = _find_ms_section_by_keywords(
-                        ms_doc, ms_sections, keywords, qn, r.get("marks", 0) or 0)
-                    if kw_sec is not None and kw_idx != row_to_section_idx.get(ri, -1):
-                        sec    = kw_sec
-                        q_info = sec.get("questions", {}).get(qn)
-                        if q_info is None:
-                            q_info = _find_q_in_section_pages(ms_doc, sec, qn)
+            # (keyword override removed to prevent cross-exam contamination)
             if q_info is None and sec and sec.get("questions"):
                 qs_s   = sorted(sec["questions"].keys())
                 first_q = sec["questions"][qs_s[0]]
