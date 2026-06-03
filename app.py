@@ -907,7 +907,7 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
                     continue
                 full_line = "".join(s.get("text", "") for s in spans).strip()
                 bb = line["bbox"]
-                if bb[0] > 80:
+                if bb[0] > 200:   # raised to 200 to catch table-format Q markers
                     continue
                 qn = None
                 m = pat_strict.match(full_line) or pat_qa.match(full_line)
@@ -919,7 +919,7 @@ def find_ms_question_locations(ms_bytes: bytes) -> list[dict]:
                         qn = int(mq.group(1))
                     else:
                         m2 = pat_nodot.match(full_line)
-                        if m2 and bb[0] < 50:
+                        if m2 and bb[0] < 170:
                             font = spans[0].get("font", "")
                             size = spans[0].get("size", 0)
                             if ("Bold" in font or "bold" in font) and 9 <= size <= 14:
@@ -3527,6 +3527,51 @@ if st.button(
                             })
                         _prev_ib_code = _ib_code
 
+            # ── Build date → section index map from MS cover pages ──────
+            _ms_date_to_idx: dict[str, int] = {}
+            try:
+                _ms_scan2 = _fitz.open(stream=ms_bytes, filetype="pdf")
+                _prev_code_d = None
+                for _pi_d in range(len(_ms_scan2)):
+                    _ptxt_d = _ms_scan2[_pi_d].get_text()
+                    # Detect new exam section by any code
+                    _any_code = None
+                    for _m1d,_m2d in re.findall(r"(\d{4})\s*[–\-]\s*(\d{4})M?\b",_ptxt_d):
+                        _cd = f"{_m1d}-{_m2d}"
+                        if _m1d[0] in ("2","8") and _m2d[0] in ("6","9"):
+                            _any_code = _cd; break
+                    if not _any_code:
+                        _ibm = re.search(r"([MN]\d{2})/4/BIOLO/HP2",_ptxt_d)
+                        if _ibm: _any_code = _ibm.group(0)
+                    if _any_code and _any_code != _prev_code_d:
+                        # Find month/year on this page
+                        _dm = re.search(
+                            r"(January|February|March|April|May|June|July|August|"
+                            r"September|October|November|December)\s+(\d{4})",
+                            _ptxt_d, re.I
+                        )
+                        if _dm:
+                            _mon = _dm.group(1).title()
+                            _yr  = _dm.group(2)
+                            # Normalize Oct/Nov → same session
+                            _norm_mon = "November" if _mon in ("October","November","December") else _mon
+                            _date_key = f"{_mon} {_yr}"          # exact: "November 2023"
+                            _norm_key = f"{_norm_mon} {_yr}"      # normalized
+                            # Find nearest ms_section for this page
+                            _bsi_d,_bd_d = -1, 999
+                            for _si_d,_sc_d in enumerate(ms_sections):
+                                _d_ = abs(_sc_d.get("start_page",0) - (_pi_d+1))
+                                if _d_ < _bd_d: _bd_d=_d_; _bsi_d=_si_d
+                            if _bsi_d >= 0 and _bd_d <= 30:
+                                if _date_key not in _ms_date_to_idx:
+                                    _ms_date_to_idx[_date_key] = _bsi_d
+                                if _norm_key not in _ms_date_to_idx:
+                                    _ms_date_to_idx[_norm_key] = _bsi_d
+                        _prev_code_d = _any_code
+                _ms_scan2.close()
+            except Exception:
+                _ms_date_to_idx = {}
+
             _ms_scan_tmp.close()
 
             # ── Decode Excel reference text to IB paper codes ────────────
@@ -3601,6 +3646,44 @@ if st.button(
                 _ref_order2.append(_code2)
             _ref_rows2.setdefault(_code2, []).append(_ri2)
 
+        # ── Supplement ms_sections with IB-code-based sessions for files
+        # where some sections have no standard Q markers (e.g. N20 format)
+        # Scan MS for IB code / numeric code boundaries and create virtual sections
+        try:
+            _ms_virt = fitz.open(stream=ms_bytes, filetype="pdf")
+            _virt_sessions = []  # (code, start_pi, end_pi)
+            _vprev = None; _vstart = 0
+            for _vpi in range(len(_ms_virt)):
+                _vtxt = _ms_virt[_vpi].get_text()
+                _vcode = None
+                for _vm1,_vm2 in re.findall(r"(\d{4})\s*[–\-]\s*(\d{4})M?\b",_vtxt):
+                    _vc=f"{_vm1}-{_vm2}"
+                    if _vm1[0] in("2","8") and _vm2[0] in("6","9"): _vcode=_vc; break
+                if not _vcode:
+                    _vibm=re.search(r"([MN]\d{2})/4/BIOLO/HP2/ENG/TZ(\d)",_vtxt)
+                    if _vibm: _vcode=_vibm.group(0)
+                if _vcode and _vcode != _vprev:
+                    if _vprev: _virt_sessions.append((_vprev, _vstart, _vpi-1))
+                    _vstart=_vpi; _vprev=_vcode
+            if _vprev: _virt_sessions.append((_vprev, _vstart, len(_ms_virt)-1))
+            _ms_virt.close()
+            # For each virtual session, check if ms_sections already covers it
+            for _vcode2, _vs, _ve in _virt_sessions:
+                _covered = any(
+                    _vs <= (s.get("start_page",1)-1) <= _ve
+                    for s in ms_sections
+                )
+                if not _covered:
+                    # Add a virtual section with start_page = _vs+1
+                    # Find Q markers within _vs.._ve range in a broader scan
+                    _virt_sec = {"questions":{1:{"page_idx":_vs}},"_order":[(1,_vs,100)],"start_page":_vs+1,"max_qn":1,"_virtual_code":_vcode2}
+                    ms_sections.append(_virt_sec)
+            n_ms = len(ms_sections)
+            # Sort by start_page
+            ms_sections.sort(key=lambda s: s.get("start_page",0))
+        except Exception:
+            pass
+
         # ── Assign each row to its MS section (or None) ─────────────────────────
         _match_debug: list[dict] = []   # for debug table
 
@@ -3634,7 +3717,29 @@ if st.button(
                         _ms_idx2 = _ib_si; _method2 = f"IB code ({_ib_cand})"
                         break
 
-            # ── 3. Smart positional fallback ────────────────────────────────
+            # ── 3. Date/month-year matching ──────────────────────────────────
+            if _ms_idx2 < 0:
+                # Extract date from full ref string and look up in _ms_date_to_idx
+                _full_ref3 = (xl_rows[_ref_rows2[_code2][0]].get("ref","")
+                              if _ref_rows2.get(_code2) else _code2)
+                _date_m3 = re.search(
+                    r"(January|February|March|April|May|June|July|August|"
+                    r"September|October|November|December)\s+(\d{4})",
+                    _full_ref3, re.I
+                )
+                if _date_m3:
+                    _mon3  = _date_m3.group(1).title()
+                    _yr3   = _date_m3.group(2)
+                    # Try exact month, then normalized (Oct→November)
+                    _norm3 = "November" if _mon3 in ("October","November","December") else _mon3
+                    for _dk in (f"{_mon3} {_yr3}", f"{_norm3} {_yr3}"):
+                        _dsi = _ms_date_to_idx.get(_dk)
+                        if _dsi is not None and 0 <= _dsi < n_ms:
+                            _ms_idx2 = _dsi
+                            _method2 = f"Date match ({_dk})"
+                            break
+
+            # ── 4. Smart positional fallback ────────────────────────────────
             # Use positional ONLY when the number of QP exam blocks matches
             # the number of MS sections exactly → files are aligned (same exam set).
             # When counts mismatch (old files had more MS than QP), skip positional.
