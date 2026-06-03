@@ -3509,6 +3509,14 @@ if st.button(
                         _bsi, _bd = _nearest_sec(_pi2)
                         if _bsi >= 0 and _bd <= 25 and _ib_code not in _ib_code_to_idx:
                             _ib_code_to_idx[_ib_code] = _bsi
+                            # Also store normalized key: "M18/TZ2" and "N21/TZ0"
+                            _tz_nm = re.search(r"TZ(\d)", _ib_code)
+                            _sess_yr_nm = re.match(r"([MN]\d{2})", _ib_code)
+                            if _tz_nm and _sess_yr_nm:
+                                _norm_key = f"{_sess_yr_nm.group(1)}/TZ{_tz_nm.group(1)}"
+                                _ib_code_to_idx[_norm_key] = _bsi
+                            elif _sess_yr_nm:
+                                _ib_code_to_idx[_sess_yr_nm.group(1)] = _bsi
                             _ms_code_debug.append({
                                 "MS Exam Code": _ib_code,
                                 "Format": "IB-paper-code",
@@ -3573,16 +3581,28 @@ if st.button(
         _ref_rows2: dict[str, list[int]] = {}
         for _ri2, _row2 in enumerate(xl_rows):
             _raw_ref2 = _row2.get("ref", "") or ""
+            # Try to extract a normalized exam key from the ref string:
+            # 1. Numeric code like "8823-6014"
+            # 2. IB paper code like "M18/4/BIOLO/HP2/ENG/TZ2"
+            # 3. Generic with date like "Biology Higher level Paper 2 (14 May 2024)"
             _cm2 = re.search(r"(\d{4})[^\d]+(\d{4})", _raw_ref2)
-            _code2 = f"{_cm2.group(1)}-{_cm2.group(2)}" if _cm2 else _raw_ref2[:20]
+            _ib2 = re.match(r"([MN]\d{2}/4/BIOLO/HP2(?:/ENG/TZ\d)?)", _raw_ref2)
+            if _cm2:
+                _code2 = f"{_cm2.group(1)}-{_cm2.group(2)}"
+            elif _ib2:
+                # Normalize: "M18/4/BIOLO/HP2/ENG/TZ2" → "M18/TZ2"
+                _ib_full = _ib2.group(1)
+                _tz_m = re.search(r"TZ(\d)", _ib_full)
+                _sess_yr = re.match(r"([MN]\d{2})", _ib_full).group(1)
+                _code2 = f"{_sess_yr}/TZ{_tz_m.group(1)}" if _tz_m else _sess_yr
+            else:
+                _code2 = _raw_ref2[:35]   # use full ref as key (for date-based matching)
             if not _ref_order2 or _ref_order2[-1] != _code2:
                 _ref_order2.append(_code2)
             _ref_rows2.setdefault(_code2, []).append(_ri2)
 
         # ── Assign each row to its MS section (or None) ─────────────────────────
         _match_debug: list[dict] = []   # for debug table
-
-        _positional_ptr = 0   # pointer for positional fallback
 
         for _code2 in _ref_order2:
             _rows_for_code = _ref_rows2[_code2]
@@ -3601,18 +3621,34 @@ if st.button(
                 _full_ref2 = _ref_rows2[_code2]   # list of row indices
                 _full_ref_str = (xl_rows[_full_ref2[0]].get("ref","") if _full_ref2
                                  else _code2)
-                for _ib_cand in _excel_to_ib_code(_full_ref_str):
+                # Also try _code2 itself if it looks like a normalized IB key
+                _cands2 = _excel_to_ib_code(_full_ref_str)
+                if not _cands2 and "/" in _code2:
+                    # _code2 IS an IB-style key → look it up directly
+                    _si_direct = _ib_code_to_idx.get(_code2)
+                    if _si_direct is not None and 0 <= _si_direct < n_ms:
+                        _ms_idx2 = _si_direct; _method2 = f"IB key direct ({_code2})"
+                for _ib_cand in (_cands2 if _ms_idx2 < 0 else []):
                     _ib_si = _ib_code_to_idx.get(_ib_cand)
                     if _ib_si is not None and 0 <= _ib_si < n_ms:
                         _ms_idx2 = _ib_si; _method2 = f"IB code ({_ib_cand})"
                         break
 
-            # ── 3. Positional fallback ─────────────────────────────────────
-            # When code and IB matching fail, map exam N → ms_section N in order
-            if _ms_idx2 < 0 and _positional_ptr < n_ms:
-                _ms_idx2 = _positional_ptr
-                _method2 = f"Positional fallback (#{_positional_ptr + 1})"
-                _positional_ptr += 1
+            # ── 3. Smart positional fallback ────────────────────────────────
+            # Use positional ONLY when the number of QP exam blocks matches
+            # the number of MS sections exactly → files are aligned (same exam set).
+            # When counts mismatch (old files had more MS than QP), skip positional.
+            if _ms_idx2 < 0:
+                _exam_position = list(_ref_order2).index(_code2)  # 0-based
+                _use_positional = (
+                    n_ms == len(_ref_order2)   # same count → aligned files
+                    and _exam_position < n_ms
+                )
+                if _use_positional:
+                    _ms_idx2 = _exam_position
+                    _method2 = f"Positional (counts match: {n_ms}={len(_ref_order2)})"
+                else:
+                    _method2 = "No match (MS not in uploaded file)"
 
             if _ms_idx2 >= 0:
                 _sec2    = ms_sections[_ms_idx2]
