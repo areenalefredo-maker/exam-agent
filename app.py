@@ -513,10 +513,10 @@ def crop_question_png(pdf_bytes: bytes, loc: dict, q_num: int = None, dpi: int =
     scale = dpi / 72
     top_px    = max(0,  int(loc["top_y"]    * scale) - 10)
     bottom_px = min(ih, int(loc["bottom_y"] * scale) + 5)
-    mrx = loc.get("marker_right_x", 0)
-    left_px = max(0, int((mrx + 6) * scale)) if mrx else 0
+    # Always start from left margin (20pt) to include the question number
+    left_px = max(0, int(20 * scale))
     pw = loc.get("page_width", 0) or (iw / scale)
-    right_px = iw - int(pw * 0.05 * scale)
+    right_px = iw - int(pw * 0.04 * scale)
     if bottom_px <= top_px or right_px <= left_px:
         return None
     cropped = img.crop((left_px, top_px, right_px, bottom_px))
@@ -2892,13 +2892,15 @@ def build_structured_worksheet(
         def _fix_runs(doc_):
             for _p in doc_.paragraphs:
                 for _r in _p.runs:
-                    if _r.text: _r.text = re.sub(r"[--]", "", _r.text)
+                    if _r.text: _r.text = re.sub(r"[-
+-]", "", _r.text)
             for _t in doc_.tables:
                 for _row in _t.rows:
                     for _c in _row.cells:
                         for _p in _c.paragraphs:
                             for _r in _p.runs:
-                                if _r.text: _r.text = re.sub(r"[--]", "", _r.text)
+                                if _r.text: _r.text = re.sub(r"[-
+-]", "", _r.text)
         _fix_runs(doc)
         buf = io.BytesIO()
         doc.save(buf)
